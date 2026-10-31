@@ -1658,6 +1658,17 @@ static NTSTATUS dcesrv_lsa_lookup_name_builtin(
 	if (!is_builtin && item->hints.domain != NULL) {
 		return NT_STATUS_NONE_MAPPED;
 	}
+	if (!is_builtin && item->hints.namespace != NULL) {
+		/*
+		 * This is 'something@namespace', an UPN never maps
+		 * to BUILTIN. Don't try to crack it here: the UPN of
+		 * another domain of our forest would fail to crack
+		 * (we don't hold its naming context) and abort the
+		 * whole lookup, before the winbind view had a chance
+		 * to resolve it.
+		 */
+		return NT_STATUS_NONE_MAPPED;
+	}
 
 	status = dcesrv_lsa_lookup_name(state->policy_state,
 					state->mem_ctx,
@@ -1856,10 +1867,14 @@ static NTSTATUS dcesrv_lsa_lookup_name_account(
 			return NT_STATUS_NONE_MAPPED;
 		}
 
-		/*
-		 * TODO: handle multiple domains in a forest together with
-		 * LSA_LOOKUP_NAMES_PRIMARY_DOMAIN_ONLY
-		 */
+		if (!dom_sid_equal(tdo->sid, policy_state->domain_sid)) {
+			/*
+			 * Another domain of our forest, resolved
+			 * through winbindd (the winbind view).
+			 */
+			return NT_STATUS_NONE_MAPPED;
+		}
+
 		is_domain = true;
 		try_lookup = true;
 	}
@@ -1870,10 +1885,6 @@ static NTSTATUS dcesrv_lsa_lookup_name_account(
 		 */
 		return NT_STATUS_NONE_MAPPED;
 	}
-
-	/*
-	 * TODO: handle multiple domains in our forest.
-	 */
 
 	status = dcesrv_lsa_lookup_name(state->policy_state,
 					state->mem_ctx,
@@ -2019,11 +2030,15 @@ static NTSTATUS dcesrv_lsa_lookup_name_winbind(
 		return NT_STATUS_OK;
 	}
 
-	if (tdo->trust_attributes & LSA_TRUST_ATTRIBUTE_WITHIN_FOREST) {
+	if ((tdo->trust_attributes & LSA_TRUST_ATTRIBUTE_WITHIN_FOREST) &&
+	    dom_sid_equal(tdo->sid, state->policy_state->domain_sid))
+	{
 		/*
-		 * The name should have been resolved in the account view.
+		 * Our own domain, the name should have been resolved
+		 * in the account view.
 		 *
-		 * TODO: handle multiple domains in a forest...
+		 * The other domains of our forest are resolved
+		 * through winbindd, like the trusted domains.
 		 */
 		return NT_STATUS_OK;
 	}
@@ -2153,11 +2168,15 @@ static NTSTATUS dcesrv_lsa_lookup_sid_winbind(
 		return NT_STATUS_OK;
 	}
 
-	if (tdo->trust_attributes & LSA_TRUST_ATTRIBUTE_WITHIN_FOREST) {
+	if ((tdo->trust_attributes & LSA_TRUST_ATTRIBUTE_WITHIN_FOREST) &&
+	    dom_sid_equal(tdo->sid, state->policy_state->domain_sid))
+	{
 		/*
-		 * The name should have been resolved in the account view.
+		 * Our own domain, the sid should have been resolved
+		 * in the account view.
 		 *
-		 * TODO: handle multiple domains in a forest...
+		 * The other domains of our forest are resolved
+		 * through winbindd, like the trusted domains.
 		 */
 		return NT_STATUS_OK;
 	}
