@@ -6247,6 +6247,7 @@ int dsdb_create_partial_replica_NC(struct ldb_context *ldb,  struct ldb_dn *dn)
 {
 	TALLOC_CTX *tmp_ctx = talloc_new(ldb);
 	struct ldb_message *msg;
+	uint32_t dsdb_flags = DSDB_MODIFY_PARTIAL_REPLICA;
 	int ret;
 
 	if (tmp_ctx == NULL) {
@@ -6288,7 +6289,47 @@ int dsdb_create_partial_replica_NC(struct ldb_context *ldb,  struct ldb_dn *dn)
 		return ldb_oom(ldb);
 	}
 
-	ret = dsdb_add(ldb, msg, DSDB_MODIFY_PARTIAL_REPLICA);
+	/*
+	 * When a new domain of our forest is created (DsAddEntry of
+	 * its crossRef on the naming master), the nCName carries the
+	 * GUID and the SID of the new domain. Keep them on the NC head,
+	 * so that the crossRef (and everything using
+	 * dsdb_trust_parse_crossref_info()) knows the SID of the
+	 * domain before its NC is replicated to us.
+	 */
+	{
+		const struct ldb_val *guid_val = NULL;
+		struct dom_sid sid;
+		NTSTATUS status;
+
+		guid_val = ldb_dn_get_extended_component(dn, "GUID");
+		if (guid_val != NULL) {
+			struct GUID guid;
+
+			status = GUID_from_ndr_blob(guid_val, &guid);
+			if (NT_STATUS_IS_OK(status)) {
+				ret = dsdb_msg_add_guid(msg, &guid,
+							"objectGUID");
+				if (ret != LDB_SUCCESS) {
+					talloc_free(tmp_ctx);
+					return ret;
+				}
+				dsdb_flags |= DSDB_MODIFY_RELAX;
+			}
+		}
+
+		status = dsdb_get_extended_dn_sid(dn, &sid, "SID");
+		if (NT_STATUS_IS_OK(status)) {
+			ret = samdb_msg_add_dom_sid(ldb, msg, msg,
+						    "objectSid", &sid);
+			if (ret != LDB_SUCCESS) {
+				talloc_free(tmp_ctx);
+				return ret;
+			}
+		}
+	}
+
+	ret = dsdb_add(ldb, msg, dsdb_flags);
 	if (ret != LDB_SUCCESS && ret != LDB_ERR_ENTRY_ALREADY_EXISTS) {
 		DEBUG(0,("Failed to create new NC for %s - %s (%s)\n",
 			 ldb_dn_get_linearized(dn),
