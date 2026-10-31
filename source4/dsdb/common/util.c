@@ -5982,6 +5982,72 @@ const char *samdb_default_domain_name(struct ldb_context *ldb, TALLOC_CTX *mem_c
 }
 
 /*
+ * The serverReference of the server object of a DC of another domain
+ * of our forest points to its computer account, in a domain NC we
+ * don't hold, so we don't have it (no phantoms yet).
+ *
+ * Accept such a DSA for sid if the domain NC the DSA hosts
+ * (msDS-HasDomainNCs) is the domain of sid, and is not our domain.
+ */
+static bool dsdb_validate_dsa_guid_other_domain(struct ldb_context *ldb,
+						TALLOC_CTX *mem_ctx,
+						const struct GUID *dsa_guid,
+						const struct dom_sid *sid)
+{
+	const char *attrs[] = { "msDS-HasDomainNCs", NULL };
+	const struct dom_sid *our_sid = samdb_domain_sid(ldb);
+	struct ldb_message *msg = NULL;
+	struct ldb_dn *nc_dn = NULL;
+	struct dom_sid domain_sid;
+	NTSTATUS status;
+	int ret;
+
+	if (our_sid == NULL) {
+		return false;
+	}
+
+	ret = dsdb_search_one(ldb, mem_ctx, &msg,
+			      ldb_get_config_basedn(ldb), LDB_SCOPE_SUBTREE,
+			      attrs, DSDB_SEARCH_SHOW_EXTENDED_DN,
+			      "(&(objectGUID=%s)(objectClass=nTDSDSA))",
+			      GUID_string(mem_ctx, dsa_guid));
+	if (ret != LDB_SUCCESS) {
+		return false;
+	}
+
+	nc_dn = ldb_msg_find_attr_as_dn(ldb, mem_ctx, msg, "msDS-HasDomainNCs");
+	if (nc_dn == NULL) {
+		return false;
+	}
+
+	status = dsdb_get_extended_dn_sid(nc_dn, &domain_sid, "SID");
+	if (!NT_STATUS_IS_OK(status)) {
+		return false;
+	}
+
+	if (dom_sid_equal(&domain_sid, our_sid)) {
+		/* a DC of our own domain must have its serverReference */
+		return false;
+	}
+
+	if (!dom_sid_in_domain(&domain_sid, sid)) {
+		DEBUG(0,(__location__ ": Bad DSA objectGUID %s for sid %s - "
+			 "the DSA is a DC of domain %s\n",
+			 GUID_string(mem_ctx, dsa_guid),
+			 dom_sid_string(mem_ctx, sid),
+			 dom_sid_string(mem_ctx, &domain_sid)));
+		return false;
+	}
+
+	DEBUG(3,(__location__ ": DSA objectGUID %s is a DC of domain %s of "
+		 "our forest, accepted for sid %s\n",
+		 GUID_string(mem_ctx, dsa_guid),
+		 dom_sid_string(mem_ctx, &domain_sid),
+		 dom_sid_string(mem_ctx, sid)));
+	return true;
+}
+
+/*
    validate that an DSA GUID belongs to the specified user sid.
    The user SID must be a domain controller account (either RODC or
    RWDC)
@@ -6042,6 +6108,11 @@ int dsdb_validate_dsa_guid(struct ldb_context *ldb,
 	}
 
 	account_dn = ldb_msg_find_attr_as_dn(ldb, tmp_ctx, msg, "serverReference");
+	if (account_dn == NULL &&
+	    dsdb_validate_dsa_guid_other_domain(ldb, tmp_ctx, dsa_guid, sid)) {
+		talloc_free(tmp_ctx);
+		return LDB_SUCCESS;
+	}
 	if (account_dn == NULL) {
 		DEBUG(1,(__location__ ": Failed to find account dn "
 			 "(serverReference) for %s, parent of DSA with "
