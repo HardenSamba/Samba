@@ -75,14 +75,9 @@ isCriticalSystemObject: TRUE
 
 # Add other groups
 
-dn: CN=Enterprise Read-only Domain Controllers,CN=Users,${DOMAINDN}
-objectClass: top
-objectClass: group
-description: Members of this group are Read-Only Domain Controllers in the enterprise
-objectSid: ${DOMAINSID}-498
-sAMAccountName: Enterprise Read-only Domain Controllers
-groupType: -2147483640
-isCriticalSystemObject: TRUE
+# NOTICE: The forest-wide groups (Enterprise Admins, Schema Admins,
+# Enterprise Read-only Domain Controllers) only exist in the forest root
+# domain, they are in "provision_users_forest_root.ldif"
 
 dn: CN=Domain Admins,CN=Users,${DOMAINDN}
 objectClass: top
@@ -101,28 +96,6 @@ description: Members of this group are permitted to publish certificates to the 
 objectSid: ${DOMAINSID}-517
 sAMAccountName: Cert Publishers
 groupType: -2147483644
-isCriticalSystemObject: TRUE
-
-dn: CN=Schema Admins,CN=Users,${DOMAINDN}
-objectClass: top
-objectClass: group
-description: Designated administrators of the schema
-member: CN=Administrator,CN=Users,${DOMAINDN}
-objectSid: ${DOMAINSID}-518
-adminCount: 1
-sAMAccountName: Schema Admins
-groupType: -2147483640
-isCriticalSystemObject: TRUE
-
-dn: CN=Enterprise Admins,CN=Users,${DOMAINDN}
-objectClass: top
-objectClass: group
-description: Designated administrators of the enterprise
-member: CN=Administrator,CN=Users,${DOMAINDN}
-objectSid: ${DOMAINSID}-519
-adminCount: 1
-sAMAccountName: Enterprise Admins
-groupType: -2147483640
 isCriticalSystemObject: TRUE
 
 dn: CN=Group Policy Creator Owners,CN=Users,${DOMAINDN}
@@ -169,8 +142,6 @@ member: CN=Read-only Domain Controllers,CN=Users,${DOMAINDN}
 member: CN=Group Policy Creator Owners,CN=Users,${DOMAINDN}
 member: CN=Domain Admins,CN=Users,${DOMAINDN}
 member: CN=Cert Publishers,CN=Users,${DOMAINDN}
-member: CN=Enterprise Admins,CN=Users,${DOMAINDN}
-member: CN=Schema Admins,CN=Users,${DOMAINDN}
 member: CN=Domain Controllers,CN=Users,${DOMAINDN}
 member: CN=krbtgt,CN=Users,${DOMAINDN}
 objectSid: ${DOMAINSID}-572
@@ -219,7 +190,6 @@ objectClass: top
 objectClass: group
 description: Administrators have complete and unrestricted access to the computer/domain
 member: CN=Domain Admins,CN=Users,${DOMAINDN}
-member: CN=Enterprise Admins,CN=Users,${DOMAINDN}
 member: CN=Administrator,CN=Users,${DOMAINDN}
 objectSid: S-1-5-32-544
 adminCount: 1

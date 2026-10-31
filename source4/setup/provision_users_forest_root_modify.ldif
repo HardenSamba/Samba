@@ -1,0 +1,15 @@
+# Memberships of the forest root groups, see
+# provision_users_forest_root.ldif
+
+dn: CN=Denied RODC Password Replication Group,CN=Users,${DOMAINDN}
+changetype: modify
+add: member
+member: CN=Enterprise Admins,CN=Users,${DOMAINDN}
+member: CN=Schema Admins,CN=Users,${DOMAINDN}
+-
+
+dn: CN=Administrators,CN=Builtin,${DOMAINDN}
+changetype: modify
+add: member
+member: CN=Enterprise Admins,CN=Users,${DOMAINDN}
+-

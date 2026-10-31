@@ -103,6 +103,7 @@ from samba.descriptor import (
     get_domain_delete_protected1_descriptor,
     get_domain_delete_protected2_descriptor,
     get_managed_service_accounts_descriptor,
+    fix_forest_root_sids,
 )
 from samba.provision.common import (
     setup_path,
@@ -1396,7 +1397,14 @@ def fill_samdb(samdb, lp, names, logger, policyguid,
     else:
         domainguid_line = ""
 
-    descr = b64encode(get_domain_descriptor(names.domainsid)).decode('utf8')
+    def domain_nc_sd(get_descriptor):
+        # Descriptors of objects of the domain NC: in a child domain
+        # EA/SA/RO/EK are the groups of the forest root domain
+        sd = get_descriptor(names.domainsid)
+        sd = fix_forest_root_sids(sd, names.domainsid, names.forestsid)
+        return b64encode(sd).decode('utf8')
+
+    descr = domain_nc_sd(get_domain_descriptor)
     setup_add_ldif(samdb, setup_path("provision_basedn.ldif"), {
             "DOMAINDN": names.domaindn,
             "DOMAINSID": str(names.domainsid),
@@ -1447,7 +1455,7 @@ def fill_samdb(samdb, lp, names, logger, policyguid,
     msg["subRefs"] = ldb.MessageElement(names.configdn, ldb.FLAG_MOD_ADD,
                                         "subRefs")
 
-    deletedobjects_descr = b64encode(get_deletedobjects_descriptor(names.domainsid)).decode('utf8')
+    deletedobjects_descr = domain_nc_sd(get_deletedobjects_descriptor)
 
     samdb.invocation_id = invocationid
 
@@ -1516,7 +1524,7 @@ def fill_samdb(samdb, lp, names, logger, policyguid,
                           })
 
     logger.info("Adding users container")
-    users_desc = b64encode(get_domain_users_descriptor(names.domainsid)).decode('utf8')
+    users_desc = domain_nc_sd(get_domain_users_descriptor)
     setup_add_ldif(samdb, setup_path("provision_users_add.ldif"), {
             "DOMAINDN": names.domaindn,
             "USERS_DESCRIPTOR": users_desc
@@ -1525,7 +1533,7 @@ def fill_samdb(samdb, lp, names, logger, policyguid,
     setup_modify_ldif(samdb, setup_path("provision_users_modify.ldif"), {
             "DOMAINDN": names.domaindn})
     logger.info("Adding computers container")
-    computers_desc = b64encode(get_domain_computers_descriptor(names.domainsid)).decode('utf8')
+    computers_desc = domain_nc_sd(get_domain_computers_descriptor)
     setup_add_ldif(samdb, setup_path("provision_computers_add.ldif"), {
             "DOMAINDN": names.domaindn,
             "COMPUTERS_DESCRIPTOR": computers_desc
@@ -1535,11 +1543,11 @@ def fill_samdb(samdb, lp, names, logger, policyguid,
                       setup_path("provision_computers_modify.ldif"), {
                           "DOMAINDN": names.domaindn})
     logger.info("Setting up sam.ldb data")
-    infrastructure_desc = b64encode(get_domain_infrastructure_descriptor(names.domainsid)).decode('utf8')
-    lostandfound_desc = b64encode(get_domain_delete_protected2_descriptor(names.domainsid)).decode('utf8')
-    system_desc = b64encode(get_domain_delete_protected1_descriptor(names.domainsid)).decode('utf8')
-    builtin_desc = b64encode(get_domain_builtin_descriptor(names.domainsid)).decode('utf8')
-    controllers_desc = b64encode(get_domain_controllers_descriptor(names.domainsid)).decode('utf8')
+    infrastructure_desc = domain_nc_sd(get_domain_infrastructure_descriptor)
+    lostandfound_desc = domain_nc_sd(get_domain_delete_protected2_descriptor)
+    system_desc = domain_nc_sd(get_domain_delete_protected1_descriptor)
+    builtin_desc = domain_nc_sd(get_domain_builtin_descriptor)
+    controllers_desc = domain_nc_sd(get_domain_controllers_descriptor)
     setup_add_ldif(samdb, setup_path("provision.ldif"), {
         "CREATTIME": str(samba.unix2nttime(int(time.time()))),
         "DOMAINDN": names.domaindn,
@@ -1557,9 +1565,12 @@ def fill_samdb(samdb, lp, names, logger, policyguid,
         "DOMAIN_CONTROLLERS_DESCRIPTOR": controllers_desc,
     })
 
+    # CN=Managed Service Accounts is in the domain NC, so it is needed
+    # for a child domain (FILL_SUBDOMAIN) too.
+    managedservice_descr = domain_nc_sd(get_managed_service_accounts_descriptor)
+
     # If we are setting up a subdomain, then this has been replicated in, so we don't need to add it
     if fill == FILL_FULL:
-        managedservice_descr = b64encode(get_managed_service_accounts_descriptor(names.domainsid)).decode('utf8')
         setup_modify_ldif(samdb,
                           setup_path("provision_configuration_references.ldif"), {
                               "CONFIGDN": names.configdn,
@@ -1586,6 +1597,21 @@ def fill_samdb(samdb, lp, names, logger, policyguid,
             "ADMINPASS_B64": b64encode(adminpass.encode('utf-16-le')).decode('utf8'),
             "KRBTGTPASS_B64": b64encode(krbtgtpass.encode('utf-16-le')).decode('utf8')
         }, controls=["relax:0", "provision:0"])
+
+        if fill == FILL_FULL:
+            # Enterprise Admins, Schema Admins and Enterprise
+            # Read-only Domain Controllers only exist in the forest
+            # root domain. A child domain (FILL_SUBDOMAIN) uses the
+            # groups of the forest root domain.
+            logger.info("Setting up the forest root groups")
+            setup_add_ldif(samdb, setup_path("provision_users_forest_root.ldif"), {
+                "DOMAINDN": names.domaindn,
+                "DOMAINSID": str(names.domainsid),
+            }, controls=["relax:0", "provision:0"])
+            setup_modify_ldif(samdb,
+                              setup_path("provision_users_forest_root_modify.ldif"), {
+                                  "DOMAINDN": names.domaindn,
+                              }, controls=["relax:0", "provision:0"])
 
         logger.info("Setting up self join")
         setup_self_join(samdb, admin_session_info, names=names, fill=fill,

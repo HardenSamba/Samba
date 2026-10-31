@@ -27,7 +27,7 @@
 """Functions for setting up a Samba configuration (security descriptors)."""
 
 from samba.dcerpc import security
-from samba.ndr import ndr_pack
+from samba.ndr import ndr_pack, ndr_unpack
 from samba.schema import get_schema_descriptor
 import ldb
 import re
@@ -43,6 +43,44 @@ def sddl2binary(sddl_in, domain_sid, name_map):
 
     sec = security.descriptor.from_sddl(sddl, domain_sid)
     return ndr_pack(sec)
+
+
+# RIDs of the groups that only exist in the forest root domain. In the
+# SDDL aliases EA, SA, RO and EK they are relative to the forest root
+# domain SID, not to the SID of the domain the descriptor is for.
+FOREST_ROOT_RIDS = (security.DOMAIN_RID_ENTERPRISE_READONLY_DCS,
+                    security.DOMAIN_RID_SCHEMA_ADMINS,
+                    security.DOMAIN_RID_ENTERPRISE_ADMINS,
+                    security.DOMAIN_RID_ENTERPRISE_KEY_ADMINS)
+
+
+def fix_forest_root_sids(sd_binary, domain_sid, forest_sid):
+    """Rewrite the forest-wide group SIDs of a descriptor built for a
+    child domain.
+
+    The descriptors in this file are built with security.descriptor's
+    from_sddl(sddl, domain_sid), which resolves EA, SA, RO and EK
+    relative to domain_sid. That is only right in the forest root
+    domain: in a child domain they must be relative to forest_sid.
+
+    :param sd_binary: NDR packed security descriptor
+    :param domain_sid: SID of the domain the descriptor was built for
+    :param forest_sid: SID of the forest root domain
+    :return: NDR packed security descriptor
+    """
+    if forest_sid is None or str(forest_sid) == str(domain_sid):
+        return sd_binary
+
+    sd = ndr_unpack(security.descriptor, sd_binary)
+    # Without a domain SID, as_sddl() writes every domain relative
+    # SID in full, so we can rewrite them textually.
+    sddl = sd.as_sddl()
+    for rid in FOREST_ROOT_RIDS:
+        sddl = re.sub(r"%s-%d(?![0-9])" % (re.escape(str(domain_sid)), rid),
+                      "%s-%d" % (str(forest_sid), rid),
+                      sddl)
+    sd = security.descriptor.from_sddl(sddl, security.dom_sid(str(domain_sid)))
+    return ndr_pack(sd)
 
 
 def get_empty_descriptor(domain_sid, name_map=None):

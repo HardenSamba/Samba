@@ -28,6 +28,7 @@ import ldb
 from base64 import b64encode
 import subprocess
 import samba
+from samba.auth import system_session, admin_session
 from samba.tdb_util import tdb_copy
 from samba.mdb_util import mdb_copy
 from samba.ndr import ndr_pack, ndr_unpack
@@ -1242,8 +1243,24 @@ def setup_ad_dns(samdb, secretsdb, names, paths, logger,
 
             # Create DNS partitions
             logger.info("Creating DomainDnsZones and ForestDnsZones partitions")
-            create_dns_partitions(samdb, names.domainsid, names, domaindn, forestdn,
-                                  dnsadmins_sid, fill_level)
+            if fill_level == FILL_SUBDOMAIN:
+                # The crossRef of DomainDnsZones goes into the
+                # Configuration NC, where the administrator of a
+                # child domain (whose session we are using) has no
+                # rights: only the Enterprise Admins of the forest
+                # root domain have. This is our own local database,
+                # so we create it as system.
+                samdb.set_session_info(system_session())
+                try:
+                    create_dns_partitions(samdb, names.domainsid, names,
+                                          domaindn, forestdn,
+                                          dnsadmins_sid, fill_level)
+                finally:
+                    samdb.set_session_info(admin_session(samdb.lp,
+                                                         str(names.domainsid)))
+            else:
+                create_dns_partitions(samdb, names.domainsid, names, domaindn, forestdn,
+                                      dnsadmins_sid, fill_level)
 
             # Populating dns partitions
             logger.info("Populating DomainDnsZones and ForestDnsZones partitions")

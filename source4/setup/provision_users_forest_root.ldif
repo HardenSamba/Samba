@@ -1,0 +1,35 @@
+# Groups that only exist in the forest root domain.
+#
+# They are not created when provisioning a child domain (FILL_SUBDOMAIN),
+# where the corresponding SIDs are those of the forest root domain.
+
+dn: CN=Enterprise Read-only Domain Controllers,CN=Users,${DOMAINDN}
+objectClass: top
+objectClass: group
+description: Members of this group are Read-Only Domain Controllers in the enterprise
+objectSid: ${DOMAINSID}-498
+sAMAccountName: Enterprise Read-only Domain Controllers
+groupType: -2147483640
+isCriticalSystemObject: TRUE
+
+dn: CN=Schema Admins,CN=Users,${DOMAINDN}
+objectClass: top
+objectClass: group
+description: Designated administrators of the schema
+member: CN=Administrator,CN=Users,${DOMAINDN}
+objectSid: ${DOMAINSID}-518
+adminCount: 1
+sAMAccountName: Schema Admins
+groupType: -2147483640
+isCriticalSystemObject: TRUE
+
+dn: CN=Enterprise Admins,CN=Users,${DOMAINDN}
+objectClass: top
+objectClass: group
+description: Designated administrators of the enterprise
+member: CN=Administrator,CN=Users,${DOMAINDN}
+objectSid: ${DOMAINSID}-519
+adminCount: 1
+sAMAccountName: Enterprise Admins
+groupType: -2147483640
+isCriticalSystemObject: TRUE
