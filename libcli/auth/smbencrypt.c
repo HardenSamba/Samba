@@ -779,6 +779,92 @@ static NTSTATUS NTLMv2_RESPONSE_verify_workstation(const char *account_name,
 	return NT_STATUS_OK;
 }
 
+/*
+ * MS-NRPC 3.5.4.5.1.1 Pass-through domain name validation for a secure
+ * channel from another domain of our forest (parent-child trust).
+ *
+ * The NTLMv2 exchange must have been targeted at a server of a domain
+ * of our forest, but not of our own domain: a request relayed from a
+ * server of our domain is refused.
+ */
+static NTSTATUS NTLMv2_RESPONSE_verify_within_forest(
+			const char *account_name,
+			const char *account_domain,
+			const char *nbt,
+			const char *dns,
+			const char *schan_name,
+			const struct netlogon_creds_CredentialState *creds,
+			const struct trust_forest_domain_info *ld,
+			const struct trust_forest_domain_info *rd)
+{
+	size_t fi;
+	bool match;
+
+	match = strequal(nbt, ld->tdo->netbios_name.string);
+	if (!match && dns != NULL) {
+		match = strequal(dns, ld->tdo->domain_name.string);
+	}
+	if (match) {
+		DEBUG(2,("%s: NTLMv2_RESPONSE with "
+			 "NbDomainName[%s] DnsDomainName[%s] rejected "
+			 "for user[%s\\%s] "
+			 "against %s[%s/%s] "
+			 "matches our own domain[%s/%s]\n",
+			 __func__, nbt, dns != NULL ? dns : "",
+			 account_domain,
+			 account_name,
+			 schan_name,
+			 creds->computer_name,
+			 creds->account_name,
+			 ld->tdo->netbios_name.string,
+			 ld->tdo->domain_name.string));
+		return NT_STATUS_LOGON_FAILURE;
+	}
+
+	/* the domain we trust directly */
+	match = strequal(nbt, rd->tdo->netbios_name.string);
+	if (match && dns != NULL) {
+		match = strequal(dns, rd->tdo->domain_name.string);
+	}
+	if (match) {
+		return NT_STATUS_OK;
+	}
+
+	/* or another domain of our forest */
+	for (fi = 0; ld->fti != NULL && fi < ld->fti->count; fi++) {
+		const struct lsa_ForestTrustRecord2 *r = ld->fti->entries[fi];
+		const struct lsa_ForestTrustDomainInfo *ldi = NULL;
+
+		if (r == NULL || r->type != LSA_FOREST_TRUST_DOMAIN_INFO) {
+			continue;
+		}
+		ldi = &r->forest_trust_data.domain_info;
+
+		match = strequal(nbt, ldi->netbios_domain_name.string);
+		if (match && dns != NULL) {
+			match = strequal(dns, ldi->dns_domain_name.string);
+		}
+		if (match) {
+			return NT_STATUS_OK;
+		}
+	}
+
+	DEBUG(2,("%s: NTLMv2_RESPONSE with "
+		 "NbDomainName[%s] DnsDomainName[%s] rejected "
+		 "for user[%s\\%s] "
+		 "against %s[%s/%s] "
+		 "not a domain of our forest via tdo[%s/%s]\n",
+		 __func__, nbt, dns != NULL ? dns : "",
+		 account_domain,
+		 account_name,
+		 schan_name,
+		 creds->computer_name,
+		 creds->account_name,
+		 rd->tdo->netbios_name.string,
+		 rd->tdo->domain_name.string));
+	return NT_STATUS_LOGON_FAILURE;
+}
+
 static NTSTATUS NTLMv2_RESPONSE_verify_trust(const char *account_name,
 			const char *account_domain,
 			const struct NTLMv2_RESPONSE *v2_resp,
@@ -860,19 +946,12 @@ static NTSTATUS NTLMv2_RESPONSE_verify_trust(const char *account_name,
 	SMB_ASSERT(ld != NULL);
 	SMB_ASSERT(rd != NULL);
 
-	/*
-	 * All logic below doesn't handle WITHIN_FOREST trusts,
-	 * but we don't supported them overall yet...
-	 *
-	 * Give an early error, so that the one
-	 * implementing WITHIN_FOREST support will
-	 * hit it easily...
-	 */
 	if (rd->tdo->trust_attributes & LSA_TRUST_ATTRIBUTE_WITHIN_FOREST) {
-		DBG_ERR("remote tdo[%s/%s] WITHIN_FOREST not supported yet\n",
-			rd->tdo->netbios_name.string,
-			rd->tdo->domain_name.string);
-		return NT_STATUS_NOT_SUPPORTED;
+		NTSTATUS status = NTLMv2_RESPONSE_verify_within_forest(
+			account_name, account_domain, nbt, dns,
+			schan_name, creds, ld, rd);
+		TALLOC_FREE(frame);
+		return status;
 	}
 
 	/*
