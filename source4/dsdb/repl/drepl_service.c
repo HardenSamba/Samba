@@ -263,6 +263,21 @@ static NTSTATUS drepl_replica_sync(struct irpc_message *msg,
 	werr = dreplsrv_partition_find_for_nc(service,
 	                                      &nc->guid, &nc->sid, nc->dn,
 	                                      &p);
+	if (W_ERROR_EQUAL(werr, WERR_DS_DRA_BAD_NC)) {
+		/*
+		 * The KCC may just have added a NC (e.g. a partial
+		 * replica of another domain of our forest on a global
+		 * catalog), look again.
+		 */
+		werr = dreplsrv_load_partitions(service);
+		if (W_ERROR_IS_OK(werr)) {
+			werr = dreplsrv_partition_find_for_nc(service,
+							      &nc->guid,
+							      &nc->sid,
+							      nc->dn,
+							      &p);
+		}
+	}
 	if (!W_ERROR_IS_OK(werr)) {
 		REPLICA_SYNC_FAIL("Failed to find requested Naming Context",
 				  werr);

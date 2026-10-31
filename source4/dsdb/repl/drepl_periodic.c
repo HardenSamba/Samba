@@ -106,7 +106,11 @@ static void dreplsrv_periodic_run(struct dreplsrv_service *service)
 	 * might have changed Topology graph
 	 * i.e. repsFrom/repsTo
 	 */
-	dreplsrv_refresh_partitions(service);
+	/*
+	 * dreplsrv_load_partitions() also picks up the NCs the KCC
+	 * added since (it refreshes the existing ones too)
+	 */
+	dreplsrv_load_partitions(service);
 
 	mem_ctx = talloc_new(service);
 	dreplsrv_schedule_pull_replication(service, mem_ctx);
