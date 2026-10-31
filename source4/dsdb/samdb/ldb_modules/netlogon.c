@@ -305,6 +305,14 @@ NTSTATUS fill_netlogon_samlogon_response(struct ldb_context *sam_ctx,
 		}
 	}
 
+	/* HardenSamba: advertise Active Directory Web Services when a separate
+	 * ADWS daemon serves 9389. Off unless smb.conf carries
+	 * "adws:advertise = yes", because announcing the capability with nothing
+	 * listening makes a client connect and fail rather than look elsewhere. */
+	if (lpcfg_parm_bool(lp_ctx, NULL, "adws", "advertise", false)) {
+		server_type |= DS_SERVER_WEBSERV;
+	}
+
 	if (dc_level >= DS_DOMAIN_FUNCTION_2012) {
 		server_type |= DS_SERVER_DS_8;
 	}
