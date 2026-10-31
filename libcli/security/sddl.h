@@ -29,6 +29,10 @@
 
 struct security_descriptor *sddl_decode(TALLOC_CTX *mem_ctx, const char *sddl,
 					const struct dom_sid *domain_sid);
+struct security_descriptor *sddl_decode_forest(TALLOC_CTX *mem_ctx,
+					       const char *sddl,
+					       const struct dom_sid *domain_sid,
+					       const struct dom_sid *forest_sid);
 struct security_descriptor *sddl_decode_err_msg(TALLOC_CTX *mem_ctx, const char *sddl,
 						const struct dom_sid *domain_sid,
 						const enum ace_condition_flags ace_condition_flags,

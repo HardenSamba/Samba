@@ -1472,6 +1472,104 @@ const struct dom_sid *samdb_domain_sid_cache_only(struct ldb_context *ldb)
 	return (struct dom_sid *)ldb_get_opaque(ldb, "cache.domain_sid");
 }
 
+/*
+  get the SID of the forest root domain.
+
+  In the forest root domain this is our own domain SID. In a child
+  domain, we don't hold the forest root domain NC (unless we are a
+  GC), so we take the SID component of the nCName of the forest root
+  crossRef, which is in the Configuration NC.
+
+  The groups that only exist in the forest root domain (Enterprise
+  Admins, Schema Admins, Enterprise Read-only Domain Controllers,
+  Enterprise Key Admins) are relative to this SID.
+
+  Returns NULL if it can't be found (e.g. early in the provision).
+*/
+const struct dom_sid *samdb_forest_root_domain_sid(struct ldb_context *ldb)
+{
+	TALLOC_CTX *tmp_ctx = NULL;
+	struct dom_sid *forest_sid = NULL;
+	struct ldb_dn *root_dn = NULL;
+	struct ldb_dn *domain_dn = NULL;
+	struct ldb_dn *partitions_dn = NULL;
+	struct ldb_dn *nc_dn = NULL;
+	struct ldb_result *res = NULL;
+	struct dom_sid sid;
+	const char *attrs[] = { "nCName", NULL };
+	NTSTATUS status;
+	int ret;
+
+	forest_sid = talloc_get_type(
+		ldb_get_opaque(ldb, "cache.forest_root_domain_sid"),
+		struct dom_sid);
+	if (forest_sid != NULL) {
+		return forest_sid;
+	}
+
+	root_dn = ldb_get_root_basedn(ldb);
+	domain_dn = ldb_get_default_basedn(ldb);
+	if (root_dn == NULL || domain_dn == NULL) {
+		return NULL;
+	}
+
+	if (ldb_dn_compare(root_dn, domain_dn) == 0) {
+		/* we are in the forest root domain */
+		return samdb_domain_sid(ldb);
+	}
+
+	tmp_ctx = talloc_new(ldb);
+	if (tmp_ctx == NULL) {
+		return NULL;
+	}
+
+	partitions_dn = samdb_partitions_dn(ldb, tmp_ctx);
+	if (partitions_dn == NULL) {
+		goto failed;
+	}
+
+	ret = dsdb_search(ldb, tmp_ctx, &res, partitions_dn,
+			  LDB_SCOPE_ONELEVEL, attrs,
+			  DSDB_SEARCH_SHOW_EXTENDED_DN,
+			  "(&(objectClass=crossRef)(nCName=%s))",
+			  ldb_dn_get_linearized(root_dn));
+	if (ret != LDB_SUCCESS || res->count != 1) {
+		DBG_INFO("Can't find the crossRef of the forest root "
+			 "domain %s\n", ldb_dn_get_linearized(root_dn));
+		goto failed;
+	}
+
+	nc_dn = samdb_result_dn(ldb, tmp_ctx, res->msgs[0], "nCName", NULL);
+	if (nc_dn == NULL) {
+		goto failed;
+	}
+
+	status = dsdb_get_extended_dn_sid(nc_dn, &sid, "SID");
+	if (!NT_STATUS_IS_OK(status)) {
+		DBG_INFO("The crossRef of the forest root domain %s has "
+			 "no SID: %s\n", ldb_dn_get_linearized(root_dn),
+			 nt_errstr(status));
+		goto failed;
+	}
+
+	forest_sid = dom_sid_dup(tmp_ctx, &sid);
+	if (forest_sid == NULL) {
+		goto failed;
+	}
+
+	if (ldb_set_opaque(ldb, "cache.forest_root_domain_sid",
+			   forest_sid) != LDB_SUCCESS) {
+		goto failed;
+	}
+	talloc_steal(ldb, forest_sid);
+	talloc_free(tmp_ctx);
+	return forest_sid;
+
+failed:
+	talloc_free(tmp_ctx);
+	return NULL;
+}
+
 bool samdb_set_domain_sid(struct ldb_context *ldb, const struct dom_sid *dom_sid_in)
 {
 	TALLOC_CTX *tmp_ctx;

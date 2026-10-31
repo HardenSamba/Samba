@@ -113,6 +113,21 @@ struct descriptor_context {
 	int (*step_fn)(struct descriptor_context *);
 };
 
+/*
+ * The SID the forest wide groups (EA, SA, RO, EK) are relative to:
+ * the SID of the forest root domain, which is our own domain SID
+ * unless we are a DC of a child domain.
+ */
+static const struct dom_sid *descriptor_forest_sid(struct ldb_context *ldb)
+{
+	const struct dom_sid *forest_sid = samdb_forest_root_domain_sid(ldb);
+
+	if (forest_sid == NULL) {
+		forest_sid = samdb_domain_sid(ldb);
+	}
+	return forest_sid;
+}
+
 static struct dom_sid *get_default_ag(TALLOC_CTX *mem_ctx,
 			       struct ldb_dn *dn,
 			       const struct security_token *token,
@@ -120,9 +135,14 @@ static struct dom_sid *get_default_ag(TALLOC_CTX *mem_ctx,
 {
 	TALLOC_CTX *tmp_ctx = talloc_new(mem_ctx);
 	const struct dom_sid *domain_sid = samdb_domain_sid(ldb);
+	const struct dom_sid *forest_sid = descriptor_forest_sid(ldb);
 	struct dom_sid *da_sid = dom_sid_add_rid(tmp_ctx, domain_sid, DOMAIN_RID_ADMINS);
-	struct dom_sid *ea_sid = dom_sid_add_rid(tmp_ctx, domain_sid, DOMAIN_RID_ENTERPRISE_ADMINS);
-	struct dom_sid *sa_sid = dom_sid_add_rid(tmp_ctx, domain_sid, DOMAIN_RID_SCHEMA_ADMINS);
+	/*
+	 * Enterprise Admins and Schema Admins only exist in the forest
+	 * root domain.
+	 */
+	struct dom_sid *ea_sid = dom_sid_add_rid(tmp_ctx, forest_sid, DOMAIN_RID_ENTERPRISE_ADMINS);
+	struct dom_sid *sa_sid = dom_sid_add_rid(tmp_ctx, forest_sid, DOMAIN_RID_SCHEMA_ADMINS);
 	struct dom_sid *dag_sid;
 	struct ldb_dn *nc_root;
 	int ret;
@@ -184,9 +204,10 @@ static struct security_descriptor *get_sd_unpacked(struct ldb_module *module, TA
 		return NULL;
 	}
 
-	sd = sddl_decode(mem_ctx,
-			 objectclass->defaultSecurityDescriptor,
-			 domain_sid);
+	sd = sddl_decode_forest(mem_ctx,
+				objectclass->defaultSecurityDescriptor,
+				domain_sid,
+				descriptor_forest_sid(ldb));
 	return sd;
 }
 

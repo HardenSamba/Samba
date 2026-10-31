@@ -903,10 +903,30 @@ static struct security_acl *sddl_decode_acl(struct security_descriptor *sd,
  *
  * The message will be a direct talloc child of mem_ctx or NULL.
  */
+static struct security_descriptor *sddl_decode_err_msg_forest(
+	TALLOC_CTX *mem_ctx, const char *sddl,
+	const struct dom_sid *domain_sid,
+	const struct dom_sid *forest_sid,
+	const enum ace_condition_flags ace_condition_flags,
+	const char **msg, size_t *msg_offset);
+
 struct security_descriptor *sddl_decode_err_msg(TALLOC_CTX *mem_ctx, const char *sddl,
 						const struct dom_sid *domain_sid,
 						const enum ace_condition_flags ace_condition_flags,
 						const char **msg, size_t *msg_offset)
+{
+	return sddl_decode_err_msg_forest(mem_ctx, sddl,
+					  domain_sid, domain_sid,
+					  ace_condition_flags,
+					  msg, msg_offset);
+}
+
+static struct security_descriptor *sddl_decode_err_msg_forest(
+	TALLOC_CTX *mem_ctx, const char *sddl,
+	const struct dom_sid *domain_sid,
+	const struct dom_sid *forest_sid,
+	const enum ace_condition_flags ace_condition_flags,
+	const char **msg, size_t *msg_offset)
 {
 	struct sddl_transition_state state = {
 		/*
@@ -916,7 +936,12 @@ struct security_descriptor *sddl_decode_err_msg(TALLOC_CTX *mem_ctx, const char 
 		 */
 		.machine_sid = domain_sid,
 		.domain_sid = domain_sid,
-		.forest_sid = domain_sid,
+		/*
+		 * EA, SA, RO and EK are relative to the forest root
+		 * domain, which is only our own domain in the forest
+		 * root domain.
+		 */
+		.forest_sid = forest_sid != NULL ? forest_sid : domain_sid,
 	};
 	const char *start = sddl;
 	struct security_descriptor *sd = NULL;
@@ -1018,6 +1043,40 @@ struct security_descriptor *sddl_decode(TALLOC_CTX *mem_ctx, const char *sddl,
 							     ACE_CONDITION_FLAG_ALLOW_DEVICE,
 							     &msg,
 							     &msg_offset);
+	if (sd == NULL) {
+		DBG_NOTICE("could not decode '%s'\n", sddl);
+		if (msg != NULL) {
+			DBG_NOTICE("                  %*c\n",
+				   (int)msg_offset, '^');
+			DBG_NOTICE("error '%s'\n", msg);
+			talloc_free(discard_const(msg));
+		}
+	}
+	return sd;
+}
+
+/*
+  decode SDDL, resolving the forest wide aliases (EA, SA, RO, EK)
+  relative to forest_sid instead of domain_sid.
+
+  This is needed on a DC of a child domain. With forest_sid == NULL
+  or forest_sid == domain_sid this is the same as sddl_decode().
+*/
+struct security_descriptor *sddl_decode_forest(TALLOC_CTX *mem_ctx,
+					       const char *sddl,
+					       const struct dom_sid *domain_sid,
+					       const struct dom_sid *forest_sid)
+{
+	const char *msg = NULL;
+	size_t msg_offset = 0;
+	struct security_descriptor *sd = sddl_decode_err_msg_forest(
+		mem_ctx,
+		sddl,
+		domain_sid,
+		forest_sid,
+		ACE_CONDITION_FLAG_ALLOW_DEVICE,
+		&msg,
+		&msg_offset);
 	if (sd == NULL) {
 		DBG_NOTICE("could not decode '%s'\n", sddl);
 		if (msg != NULL) {
