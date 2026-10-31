@@ -1504,6 +1504,51 @@ class DCJoinContext(object):
                             dnspass=ctx.dnspass, os_level=ctx.behavior_version,
                             key_version_number=ctx.dns_key_version_number)
 
+    def join_add_forest_root_memberships(ctx):
+        """Give the forest wide groups of the forest root domain their
+        place in the new child domain:
+
+        - Enterprise Admins in BUILTIN\\Administrators,
+        - Enterprise Admins and Schema Admins in the Denied RODC
+          Password Replication Group.
+
+        Windows references the groups of the root domain directly
+        (phantoms). Samba can't store a link to an object of a NC it
+        doesn't hold yet, so we use foreignSecurityPrincipal objects
+        carrying their SIDs: the token of a member of these groups gets
+        the BUILTIN groups through them (auth_generate_security_token()
+        expands the memberOf of every SID of the token).
+        """
+        print("Adding the forest root groups to the groups of %s" %
+              ctx.base_dn)
+
+        fsp = {}
+        for rid in (security.DOMAIN_RID_ENTERPRISE_ADMINS,
+                    security.DOMAIN_RID_SCHEMA_ADMINS):
+            sid = "%s-%d" % (ctx.forestsid, rid)
+            fsp[rid] = "CN=%s,CN=ForeignSecurityPrincipals,%s" % (sid,
+                                                                  ctx.base_dn)
+            # Like the well-known ones of provision_users.ldif
+            ctx.local_samdb.add({
+                "dn": fsp[rid],
+                "objectClass": "foreignSecurityPrincipal",
+                "objectSid": ndr_pack(security.dom_sid(sid)),
+            }, controls=["provision:0", "relax:0"])
+
+        members = {
+            "CN=Administrators,CN=Builtin,%s" % ctx.base_dn:
+                [fsp[security.DOMAIN_RID_ENTERPRISE_ADMINS]],
+            "CN=Denied RODC Password Replication Group,CN=Users,%s" % ctx.base_dn:
+                [fsp[security.DOMAIN_RID_ENTERPRISE_ADMINS],
+                 fsp[security.DOMAIN_RID_SCHEMA_ADMINS]],
+        }
+        for group_dn, values in members.items():
+            m = ldb.Message()
+            m.dn = ldb.Dn(ctx.local_samdb, group_dn)
+            m["member"] = ldb.MessageElement(values, ldb.FLAG_MOD_ADD,
+                                             "member")
+            ctx.local_samdb.modify(m)
+
     def join_setup_trusts(ctx):
         """provision the local SAM."""
 
@@ -1651,6 +1696,7 @@ class DCJoinContext(object):
             if ctx.subdomain:
                 ctx.join_add_objects2()
                 ctx.join_provision_own_domain()
+                ctx.join_add_forest_root_memberships()
                 ctx.join_setup_trusts()
 
             if ctx.dns_backend != "NONE":
