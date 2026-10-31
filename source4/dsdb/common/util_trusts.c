@@ -341,7 +341,8 @@ static NTSTATUS dsdb_trust_crossref_tdo_info(TALLOC_CTX *mem_ctx,
 				      root_trust_dn,
 				      LDB_SCOPE_BASE,
 				      cross_attrs,
-				      DSDB_SEARCH_NO_GLOBAL_CATALOG,
+				      DSDB_SEARCH_NO_GLOBAL_CATALOG |
+				      DSDB_SEARCH_SHOW_EXTENDED_DN,
 				      "(objectClass=crossRef)");
 		if (ret != LDB_SUCCESS) {
 			status = dsdb_ldb_err_to_ntstatus(ret);
@@ -370,7 +371,8 @@ static NTSTATUS dsdb_trust_crossref_tdo_info(TALLOC_CTX *mem_ctx,
 				      trust_parent_dn,
 				      LDB_SCOPE_BASE,
 				      cross_attrs,
-				      DSDB_SEARCH_NO_GLOBAL_CATALOG,
+				      DSDB_SEARCH_NO_GLOBAL_CATALOG |
+				      DSDB_SEARCH_SHOW_EXTENDED_DN,
 				      "(objectClass=crossRef)");
 		if (ret != LDB_SUCCESS) {
 			status = dsdb_ldb_err_to_ntstatus(ret);
