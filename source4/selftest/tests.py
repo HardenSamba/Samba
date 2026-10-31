@@ -1511,6 +1511,10 @@ planoldpythontestsuite("fl2000dc:local",
 planpythontestsuite("none",
                     "samba.tests.lsa_string")
 
+# EXPERIMENTAL: child domain created with
+# 'samba-tool domain join ... SUBDOMAIN' (multi-domain forest)
+planpythontestsuite("subdom_dc:local", "samba.tests.subdomain")
+
 planoldpythontestsuite("ad_dc",
                        "samba.tests.krb5_credentials",
                        extra_args=['-U"$USERNAME%$PASSWORD"'])

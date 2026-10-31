@@ -967,6 +967,17 @@ my @exported_envvars = (
 	"NT4_TRUST_DOMAIN",
 	"NT4_TRUST_DOMSID",
 
+	# stuff related to the parent domain, on a DC of a child
+	# domain (subdom_dc, EXPERIMENTAL)
+	"SUBDOM_DC_SERVER",
+	"PARENT_SERVER",
+	"PARENT_SERVER_IP",
+	"PARENT_DOMAIN",
+	"PARENT_REALM",
+	"PARENT_DOMSID",
+	"PARENT_USERNAME",
+	"PARENT_PASSWORD",
+
 	# domain controller stuff
 	"DC_SERVER",
 	"DC_SERVER_IP",
