@@ -6925,6 +6925,18 @@ bool dsdb_objects_have_same_nc(struct ldb_context *ldb,
 	}
 
 	ret = dsdb_find_nc_root(ldb, tmp_ctx, target_dn, &target_nc);
+	if (ret == LDB_ERR_NO_SUCH_OBJECT) {
+		/*
+		 * The target is not in any NC we hold, e.g. it is in
+		 * the domain NC of another domain of our forest
+		 * (the msDS-hasMasterNCs of its DCs...). It is not in
+		 * the NC of the source, which we hold.
+		 */
+		DBG_INFO("Target %s is in a NC we don't hold\n",
+			 ldb_dn_get_linearized(target_dn));
+		talloc_free(tmp_ctx);
+		return false;
+	}
 	/* fix clang warning */
 	if (target_nc == NULL) {
 		ret = LDB_ERR_OTHER;
