@@ -6215,6 +6215,69 @@ failed:
 }
 
 
+/*
+ * The first replication of a partial replica (a domain naming
+ * context held by a global catalog) instantiates its NC head.
+ *
+ * The local placeholder created together with the crossRef of the
+ * new domain (see dsdb_create_partial_replica_NC()) has
+ * INSTANCE_TYPE_UNINSTANT set. Its local metadata can be newer than
+ * the one of the replicated NC head, so the normal conflict
+ * resolution would keep the placeholder instanceType forever.
+ *
+ * Returns true if msg instantiates such a placeholder, after
+ * having adjusted the instanceType of msg: the received value,
+ * without INSTANCE_TYPE_UNINSTANT, and with INSTANCE_TYPE_NC_ABOVE
+ * as computed locally (we hold the naming context above it or not).
+ */
+static bool replmd_instantiate_nc_head(struct replmd_replicated_request *ar,
+				       struct ldb_message *msg)
+{
+	struct ldb_message_element *el = NULL;
+	struct ldb_val *v = NULL;
+	uint32_t local_it;
+	uint32_t remote_it;
+	char *s = NULL;
+
+	if (!(ar->objs->dsdb_repl_flags & DSDB_REPL_FLAG_PARTIAL_REPLICA)) {
+		return false;
+	}
+
+	el = ldb_msg_find_element(msg, "instanceType");
+	if (el == NULL || el->num_values != 1) {
+		return false;
+	}
+
+	local_it = ldb_msg_find_attr_as_uint(ar->search_msg,
+					     "instanceType", 0);
+	remote_it = ldb_msg_find_attr_as_uint(msg, "instanceType", 0);
+
+	if (!(local_it & INSTANCE_TYPE_IS_NC_HEAD) ||
+	    !(local_it & INSTANCE_TYPE_UNINSTANT)) {
+		return false;
+	}
+	if (!(remote_it & INSTANCE_TYPE_IS_NC_HEAD) ||
+	    (remote_it & INSTANCE_TYPE_UNINSTANT)) {
+		return false;
+	}
+
+	remote_it &= ~(INSTANCE_TYPE_NC_ABOVE | INSTANCE_TYPE_WRITE);
+	remote_it |= (local_it & INSTANCE_TYPE_NC_ABOVE);
+
+	s = talloc_asprintf(msg, "%u", remote_it);
+	v = talloc(msg, struct ldb_val);
+	if (s == NULL || v == NULL) {
+		return false;
+	}
+	*v = data_blob_string_const(s);
+	el->values = v;
+
+	DBG_NOTICE("Instantiating the partial replica NC head %s "
+		   "(instanceType %u => %u)\n",
+		   ldb_dn_get_linearized(msg->dn), local_it, remote_it);
+	return true;
+}
+
 static int replmd_replicated_apply_merge(struct replmd_replicated_request *ar)
 {
 	struct ldb_context *ldb;
@@ -6240,6 +6303,7 @@ static int replmd_replicated_apply_merge(struct replmd_replicated_request *ar)
 	bool renamed = false;
 	bool renamed_to_conflict = false;
 	bool is_schema_nc = false;
+	bool instantiate_nc_head = false;
 	NTSTATUS nt_status;
 	const struct ldb_val *old_rdn, *new_rdn;
 	struct replmd_private *replmd_private =
@@ -6251,6 +6315,8 @@ static int replmd_replicated_apply_merge(struct replmd_replicated_request *ar)
 
 	ldb = ldb_module_get_ctx(ar->module);
 	msg = ar->objs->objects[ar->index_current].msg;
+
+	instantiate_nc_head = replmd_instantiate_nc_head(ar, msg);
 
 	is_schema_nc = ldb_dn_compare_base(replmd_private->schema_dn, msg->dn) == 0;
 
@@ -6400,6 +6466,11 @@ static int replmd_replicated_apply_merge(struct replmd_replicated_request *ar)
 				ar->objs->dsdb_repl_flags,
 				&nmd.ctr.ctr1.array[j],
 				&rmd->ctr.ctr1.array[i]);
+			if (instantiate_nc_head &&
+			    rmd->ctr.ctr1.array[i].attid ==
+			    DRSUAPI_ATTID_instanceType) {
+				cmp = true;
+			}
 			if (cmp) {
 				/* replace the entry */
 				nmd.ctr.ctr1.array[j] = rmd->ctr.ctr1.array[i];
