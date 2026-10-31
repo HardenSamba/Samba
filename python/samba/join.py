@@ -28,7 +28,8 @@ from samba.ndr import ndr_pack, ndr_unpack
 from samba.dcerpc import security, drsuapi, misc, nbt, lsa, drsblobs, dnsserver, dnsp
 from samba.credentials import Credentials, DONT_USE_KERBEROS
 from samba.provision import (secretsdb_self_join, provision, provision_fill,
-                             FILL_DRS, FILL_SUBDOMAIN, DEFAULTSITE)
+                             FILL_DRS, FILL_SUBDOMAIN, DEFAULTSITE,
+                             DEFAULT_BACKEND_SIZE)
 from samba.provision.common import setup_path
 from samba.schema import Schema
 from samba import descriptor
@@ -38,8 +39,9 @@ from samba import read_and_sub_file
 from samba import werror
 from base64 import b64encode
 from samba import WERRORError, NTSTATUSError
+from samba import ntstatus
 from samba import sd_utils
-from samba.dnsserver import ARecord, AAAARecord, CNAMERecord
+from samba.dnsserver import ARecord, AAAARecord, CNAMERecord, NSRecord
 import random
 import time
 import re
@@ -298,8 +300,11 @@ class DCJoinContext(object):
             ctx.del_noerror(ctx.partition_dn)
 
         if ctx.subdomain:
-            binding_options = "sign"
-            lsaconn = lsa.lsarpc("ncacn_ip_tcp:%s[%s]" % (ctx.server, binding_options),
+            # Samba (as Windows) only allows LSA policy handles via
+            # named pipes, not via ncacn_ip_tcp.
+            binding_options = "seal"
+            parent_server = getattr(ctx, "parent_server", ctx.server)
+            lsaconn = lsa.lsarpc("ncacn_np:%s[%s]" % (parent_server, binding_options),
                                  ctx.lp, ctx.creds)
 
             objectAttr = lsa.ObjectAttribute()
@@ -309,17 +314,22 @@ class DCJoinContext(object):
                                              objectAttr,
                                              security.SEC_FLAG_MAXIMUM_ALLOWED)
 
+            # Remove a trust to the child domain left on the parent
+            # domain by a previous (failed) join. The parent side of
+            # the trust is named after the child domain.
             name = lsa.String()
             name.string = ctx.realm
-            info = lsaconn.QueryTrustedDomainInfoByName(pol_handle, name, lsa.LSA_TRUSTED_DOMAIN_INFO_FULL_INFO)
-
-            lsaconn.DeleteTrustedDomain(pol_handle, info.info_ex.sid)
-
-            name = lsa.String()
-            name.string = ctx.forest_domain_name
-            info = lsaconn.QueryTrustedDomainInfoByName(pol_handle, name, lsa.LSA_TRUSTED_DOMAIN_INFO_FULL_INFO)
-
-            lsaconn.DeleteTrustedDomain(pol_handle, info.info_ex.sid)
+            try:
+                info = lsaconn.QueryTrustedDomainInfoByName(pol_handle, name,
+                                                            lsa.LSA_TRUSTED_DOMAIN_INFO_FULL_INFO)
+            except NTSTATUSError as e:
+                if e.args[0] != ntstatus.NT_STATUS_OBJECT_NAME_NOT_FOUND:
+                    raise
+                info = None
+            if info is not None:
+                print("Removing old trust record for %s (SID %s)" %
+                      (ctx.realm, info.info_ex.sid))
+                lsaconn.DeleteTrustedDomain(pol_handle, info.info_ex.sid)
 
         if ctx.dns_a_dn:
             ctx.del_noerror(ctx.dns_a_dn)
@@ -399,6 +409,47 @@ class DCJoinContext(object):
                                (ldb.binary_encode(ctx.parent_dnsdomain),
                                 ldb.OID_COMPARATOR_AND, samba.dsdb.SYSTEM_FLAG_CR_NTDS_DOMAIN))
         return str(res[0].dn)
+
+    def get_naming_master(ctx):
+        """get the DNS name of the Domain Naming Master (owner of the
+        fSMORoleOwner on CN=Partitions)"""
+        res = ctx.samdb.search(base=ctx.samdb.get_partitions_dn(),
+                               attrs=['fSMORoleOwner'],
+                               scope=ldb.SCOPE_BASE,
+                               controls=["extended_dn:1:1"])
+        if 'fSMORoleOwner' not in res[0]:
+            raise DCJoinException("Can't find naming master on partition DN %s in %s" %
+                                  (ctx.samdb.get_partitions_dn(), ctx.samdb.url))
+        try:
+            master_guid = str(misc.GUID(ldb.Dn(ctx.samdb,
+                                               res[0]['fSMORoleOwner'][0].decode('utf8')).get_extended_component('GUID')))
+        except KeyError:
+            raise DCJoinException("Can't find GUID in naming master on partition DN %s" %
+                                  res[0]['fSMORoleOwner'][0])
+
+        return '%s._msdcs.%s' % (master_guid, ctx.dnsforest)
+
+    def get_forest_root_domain_sid(ctx):
+        """get the SID of the forest root domain.
+
+        This is taken from the SID component of the nCName of the
+        forest root crossRef, so it also works when we are connected
+        to a DC of a child domain (which does not hold the forest
+        root domain NC)."""
+        root_dn = str(ctx.samdb.get_root_basedn())
+        res = ctx.samdb.search(base=ctx.samdb.get_partitions_dn(),
+                               scope=ldb.SCOPE_ONELEVEL,
+                               attrs=["nCName"],
+                               expression="(&(objectClass=crossRef)(nCName=%s))" %
+                               ldb.binary_encode(root_dn),
+                               controls=["extended_dn:1:1"])
+        if len(res) != 1 or "nCName" not in res[0]:
+            raise DCJoinException("Can't find the crossRef of the forest root domain %s" % root_dn)
+        nc_dn = ldb.Dn(ctx.samdb, res[0]["nCName"][0].decode('utf8'))
+        sid = nc_dn.get_extended_component("SID")
+        if sid is None:
+            raise DCJoinException("crossRef of the forest root domain %s has no SID" % root_dn)
+        return ndr_unpack(security.dom_sid, sid)
 
     def get_mysid(ctx):
         """get the SID of the connected user. Only works with w2k8 and later,
@@ -820,7 +871,12 @@ class DCJoinContext(object):
             "dn": ctx.partition_dn,
             "objectclass": "crossRef",
             "objectCategory": "CN=Cross-Ref,%s" % ctx.schema_dn,
-            "nCName": ctx.base_dn,
+            # The GUID and SID of the new domain go with the nCName,
+            # so the naming master (and the rest of the forest) knows
+            # them before the new domain NC is replicated.
+            "nCName": "<GUID=%s>;<SID=%s>;%s" % (ctx.subdomain_guid,
+                                                 ctx.domsid,
+                                                 ctx.base_dn),
             "nETBIOSName": ctx.domain_name,
             "dnsRoot": ctx.dnsdomain,
             "trustParent": ctx.parent_partition_dn,
@@ -891,9 +947,15 @@ class DCJoinContext(object):
         # not too small, if it's too small the performance of the join will
         # be negatively impacted.
         print("Reconnecting to local samdb")
+        options = ["transaction_index_cache_size:200000"]
+        if ctx.backend_store == "mdb":
+            # The new domain partition is filled by provision_fill()
+            # below, so it needs the full LMDB map size (the LMDB
+            # default is only 1MiB).
+            store_size = ctx.backend_store_size or DEFAULT_BACKEND_SIZE
+            options.append("lmdb_env_size:%d" % store_size)
         ctx.samdb = SamDB(url=ctx.local_samdb.url,
-                         options=[
-                             "transaction_index_cache_size:200000"],
+                          options=options,
                           session_info=system_session(),
                           lp=ctx.local_samdb.lp,
                           global_schema=False)
@@ -1308,6 +1370,60 @@ class DCJoinContext(object):
         ctx.logger.info("All other DNS records (like _ldap SRV records) " +
                         "will be created by samba_dnsupdate on first startup")
 
+    def join_add_subdomain_dns_records(ctx):
+        """Add the DNS records a new child domain needs in its parent:
+
+        - a delegation (NS + glue A/AAAA) of the child zone in the
+          parent zone,
+        - the <ntdsguid>._msdcs.<forest> CNAME used for replication.
+
+        The records of the child zone itself are created locally by
+        the provision of the new domain (DomainDnsZones).
+        """
+        client_version = dnsserver.DNS_CLIENT_VERSION_LONGHORN
+        parent_server = getattr(ctx, "parent_server", ctx.server)
+
+        if not ctx.dnsdomain.lower().endswith("." + ctx.parent_dnsdomain.lower()):
+            raise DCJoinException("%s is not below %s" % (ctx.dnsdomain,
+                                                          ctx.parent_dnsdomain))
+        label = ctx.dnsdomain[:-(len(ctx.parent_dnsdomain) + 1)]
+        IPs = samba.interface_ips(ctx.lp, ctx.force_all_ips)
+
+        binding_options = "sign"
+        dns_conn = dnsserver.dnsserver("ncacn_ip_tcp:%s[%s]" % (parent_server,
+                                                               binding_options),
+                                       ctx.lp, ctx.creds)
+
+        def add_record(zone, name, rec):
+            buf = dnsserver.DNS_RPC_RECORD_BUF()
+            buf.rec = rec
+            try:
+                dns_conn.DnssrvUpdateRecord2(client_version, 0, parent_server,
+                                             zone, name, buf, None)
+            except WERRORError as e:
+                if e.args[0] != werror.WERR_DNS_ERROR_RECORD_ALREADY_EXISTS:
+                    raise
+
+        ctx.logger.info("Adding delegation %s -> %s in zone %s" %
+                        (label, ctx.dnshostname, ctx.parent_dnsdomain))
+        add_record(ctx.parent_dnsdomain, label, NSRecord(ctx.dnshostname))
+
+        glue_name = "%s.%s" % (ctx.myname.lower(), label)
+        for IP in IPs:
+            if IP.find(':') != -1:
+                rec = AAAARecord(IP)
+            else:
+                rec = ARecord(IP)
+            ctx.logger.info("Adding glue record %s.%s for %s" %
+                            (glue_name, ctx.parent_dnsdomain, IP))
+            add_record(ctx.parent_dnsdomain, glue_name, rec)
+
+        msdcs_zone = "_msdcs.%s" % ctx.dnsforest
+        msdcs_cname = str(ctx.ntds_guid)
+        ctx.logger.info("Adding DNS CNAME record %s.%s for %s" %
+                        (msdcs_cname, msdcs_zone, ctx.dnshostname))
+        add_record(msdcs_zone, msdcs_cname, CNAMERecord(ctx.dnshostname))
+
     def join_replicate_new_dns_records(ctx):
         for nc in (ctx.domaindns_zone, ctx.forestdns_zone):
             if nc in ctx.nc_list:
@@ -1391,9 +1507,14 @@ class DCJoinContext(object):
     def join_setup_trusts(ctx):
         """provision the local SAM."""
 
-        print("Setup domain trusts with server %s" % ctx.server)
+        # The intra-forest trust is between the new child domain and
+        # its parent (which is not necessarily the forest root), so
+        # we talk to the DC of the parent domain we were given, not
+        # to the naming master.
+        parent_server = getattr(ctx, "parent_server", ctx.server)
+        print("Setup domain trusts with server %s" % parent_server)
         binding_options = ""  # why doesn't signing work here? w2k8r2 claims no session key
-        lsaconn = lsa.lsarpc("ncacn_np:%s[%s]" % (ctx.server, binding_options),
+        lsaconn = lsa.lsarpc("ncacn_np:%s[%s]" % (parent_server, binding_options),
                              ctx.lp, ctx.creds)
 
         objectAttr = lsa.ObjectAttribute()
@@ -1466,28 +1587,31 @@ class DCJoinContext(object):
                                                          auth_info,
                                                          security.SEC_STD_DELETE)
 
+        # The local side of the trust points to the parent domain
         rec = {
-            "dn": "cn=%s,cn=system,%s" % (ctx.dnsforest, ctx.base_dn),
+            "dn": "cn=%s,cn=system,%s" % (ctx.parent_dnsdomain, ctx.base_dn),
             "objectclass": "trustedDomain",
             "trustType": str(info.trust_type),
             "trustAttributes": str(info.trust_attributes),
             "trustDirection": str(info.trust_direction),
-            "flatname": ctx.forest_domain_name,
-            "trustPartner": ctx.dnsforest,
+            "flatname": ctx.parent_domain_name,
+            "trustPartner": ctx.parent_dnsdomain,
             "trustAuthIncoming": ndr_pack(outgoing),
             "trustAuthOutgoing": ndr_pack(outgoing),
-            "securityIdentifier": ndr_pack(ctx.forestsid)
+            "securityIdentifier": ndr_pack(ctx.parent_domsid)
         }
         ctx.local_samdb.add(rec)
 
         rec = {
-            "dn": "cn=%s$,cn=users,%s" % (ctx.forest_domain_name, ctx.base_dn),
+            "dn": "cn=%s$,cn=users,%s" % (ctx.parent_domain_name, ctx.base_dn),
             "objectclass": "user",
             "userAccountControl": str(samba.dsdb.UF_INTERDOMAIN_TRUST_ACCOUNT),
             "clearTextPassword": ctx.trustdom_pass.encode('utf-16-le'),
-            "samAccountName": "%s$" % ctx.forest_domain_name
+            "samAccountName": "%s$" % ctx.parent_domain_name
         }
-        ctx.local_samdb.add(rec)
+        # This is what the LSA CreateTrustedDomain* calls do internally
+        ctx.local_samdb.add(rec, controls=[
+            "local_oid:%s:0" % dsdb.DSDB_CONTROL_PERMIT_INTERDOMAIN_TRUST_UAC_OID])
 
     def build_nc_lists(ctx):
         # nc_list is the list of naming context (NC) for which we will
@@ -1498,10 +1622,12 @@ class DCJoinContext(object):
         ctx.nc_list = [ctx.config_dn, ctx.schema_dn]
         ctx.full_nc_list = [ctx.base_dn, ctx.config_dn, ctx.schema_dn]
 
-        if ctx.subdomain and ctx.dns_backend != "NONE":
-            ctx.full_nc_list += [ctx.domaindns_zone]
-
-        elif not ctx.subdomain:
+        # For a new child domain, the DomainDnsZones partition (and its
+        # crossRef) is created by the local provision of the domain
+        # (setup_dns_partitions() with FILL_SUBDOMAIN), after the
+        # nTDSDSA object was created on the naming master with
+        # DsAddEntry, so it can't be listed there yet.
+        if not ctx.subdomain:
             ctx.nc_list += [ctx.base_dn]
 
             if ctx.dns_backend != "NONE":
@@ -1528,13 +1654,17 @@ class DCJoinContext(object):
                 ctx.join_setup_trusts()
 
             if ctx.dns_backend != "NONE":
-                ctx.join_add_dns_records()
-                ctx.join_replicate_new_dns_records()
+                if ctx.subdomain:
+                    ctx.join_add_subdomain_dns_records()
+                else:
+                    ctx.join_add_dns_records()
+                    ctx.join_replicate_new_dns_records()
 
             ctx.join_finalise()
-        except:
+        except Exception as e:
             try:
-                print("Join failed - cleaning up")
+                print("Join failed - cleaning up (%s: %s)" %
+                      (e.__class__.__name__, e))
             except IOError:
                 pass
 
@@ -1633,6 +1763,108 @@ def join_DC(logger=None, server=None, creds=None, lp=None, site=None, netbios_na
 
     ctx.do_join()
     logger.info("Joined domain %s (SID %s) as a DC" % (ctx.domain_name, ctx.domsid))
+
+
+def join_subdomain(logger=None, server=None, creds=None, lp=None, site=None,
+                   netbios_name=None, targetdir=None, parent_domain=None,
+                   dnsdomain=None, netbios_domain=None, machinepass=None,
+                   adminpass=None, use_ntvfs=False, dns_backend=None,
+                   plaintext_secrets=False,
+                   backend_store=None, backend_store_size=None):
+    """Create a new child domain in an existing forest, with this
+    server as its first DC.
+
+    We connect to a DC of the parent domain, create the crossRef and
+    the nTDSDSA object on the Domain Naming Master (via DsAddEntry),
+    replicate the Schema and Configuration NCs, provision the new
+    domain NC locally and finally set up the two-way intra-forest
+    (parent-child) trust.
+
+    EXPERIMENTAL: multi-domain forests are not supported by the rest
+    of Samba yet (Kerberos referrals, NTLM pass-through, LSA lookups
+    and the global catalog only handle a single domain).
+    """
+    ctx = DCJoinContext(logger, server, creds, lp, site, netbios_name,
+                        targetdir, parent_domain, machinepass, use_ntvfs,
+                        dns_backend, plaintext_secrets=plaintext_secrets,
+                        backend_store=backend_store,
+                        backend_store_size=backend_store_size)
+    ctx.subdomain = True
+    if adminpass is None:
+        ctx.adminpass = samba.generate_random_password(12, 32)
+    else:
+        ctx.adminpass = adminpass
+
+    if netbios_domain is None or netbios_domain.upper() == "WORKGROUP":
+        raise DCJoinException("A NetBIOS domain name for the new child domain "
+                              "is required ('workgroup' in smb.conf)")
+    if not dnsdomain.lower().endswith("." + ctx.dnsdomain.lower()):
+        raise DCJoinException("%s is not a child of the parent domain %s" %
+                              (dnsdomain, ctx.dnsdomain))
+
+    # Everything we learned in the constructor is about the parent
+    # domain (the domain of the DC we connected to).
+    ctx.parent_server = ctx.server
+    ctx.parent_domain_name = ctx.domain_name
+    ctx.parent_dnsdomain = ctx.dnsdomain
+    ctx.parent_domsid = ctx.domsid
+    ctx.parent_partition_dn = ctx.get_parent_partition_dn()
+    ctx.forestsid = ctx.get_forest_root_domain_sid()
+
+    ctx.domain_name = netbios_domain.upper()
+    ctx.realm = dnsdomain
+    ctx.dnsdomain = dnsdomain
+    ctx.partition_dn = "CN=%s,%s" % (ctx.domain_name,
+                                     ctx.samdb.get_partitions_dn())
+
+    # The crossRef for the new domain must be created on the Domain
+    # Naming Master.
+    ctx.naming_master = ctx.get_naming_master()
+    if ctx.naming_master != ctx.server:
+        logger.info("Reconnecting to naming master %s" % ctx.naming_master)
+        ctx.server = ctx.naming_master
+        ctx.samdb = SamDB(url="ldap://%s" % ctx.server,
+                          session_info=system_session(),
+                          credentials=ctx.creds, lp=ctx.lp)
+        res = ctx.samdb.search(base="", scope=ldb.SCOPE_BASE,
+                               attrs=['dnsHostName'], controls=[])
+        ctx.server = str(res[0]["dnsHostName"][0])
+        logger.info("DNS name of new naming master is %s" % ctx.server)
+
+    ctx.base_dn = samba.dn_from_dns_name(dnsdomain)
+    ctx.domaindns_zone = 'DC=DomainDnsZones,%s' % ctx.base_dn
+    ctx.domsid = security.random_sid()
+    ctx.subdomain_guid = misc.GUID(str(uuid.uuid4()))
+
+    # The machine account, the DFSR topology object and the RID
+    # manager all live in the new domain NC, which is created by our
+    # own provision, not on the parent domain.
+    ctx.acct_dn = None
+    ctx.topology_dn = None
+    ctx.rid_manager_dn = None
+    ctx.dnshostname = "%s.%s" % (ctx.myname.lower(), ctx.dnsdomain)
+    # Windows uses 240 bytes as UTF16 so we do
+    ctx.trustdom_pass = samba.generate_random_machine_password(120, 120)
+
+    ctx.userAccountControl = samba.dsdb.UF_SERVER_TRUST_ACCOUNT | samba.dsdb.UF_TRUSTED_FOR_DELEGATION
+
+    ctx.SPNs = ["HOST/%s" % ctx.myname,
+                "HOST/%s" % ctx.dnshostname,
+                "GC/%s/%s" % (ctx.dnshostname, ctx.dnsforest),
+                'E3514235-4B06-11D1-AB04-00C04FC2DCD2/$NTDSGUID/%s' % ctx.dnsdomain]
+    ctx.secure_channel_type = misc.SEC_CHAN_BDC
+
+    ctx.replica_flags |= (drsuapi.DRSUAPI_DRS_WRIT_REP |
+                          drsuapi.DRSUAPI_DRS_FULL_SYNC_IN_PROGRESS)
+    ctx.domain_replica_flags = ctx.replica_flags
+
+    lp.set("workgroup", ctx.domain_name)
+    lp.set("realm", ctx.realm)
+
+    ctx.do_join()
+    ctx.logger.info("Created domain %s (SID %s) as a child of %s (forest %s)" %
+                    (ctx.domain_name, ctx.domsid, ctx.parent_dnsdomain,
+                     ctx.dnsforest))
 
 
 def join_clone(logger=None, server=None, creds=None, lp=None,

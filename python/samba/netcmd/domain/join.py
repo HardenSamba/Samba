@@ -29,7 +29,7 @@ import samba
 import samba.getopt as options
 from samba import is_ad_dc_built
 from samba.dcerpc import nbt
-from samba.join import join_DC, join_RODC
+from samba.join import join_DC, join_RODC, join_subdomain
 from samba.net import LIBNET_JOIN_AUTOMATIC, Net
 from samba.net_s3 import Net as s3_Net
 from samba.netcmd import Command, CommandError, Option
@@ -42,7 +42,7 @@ from .common import common_join_options, common_provision_join_options
 class cmd_domain_join(Command):
     """Join domain as either member or backup domain controller."""
 
-    synopsis = "%prog <dnsdomain> [DC|RODC|MEMBER] [options]"
+    synopsis = "%prog <dnsdomain> [DC|RODC|MEMBER|SUBDOMAIN] [options]"
 
     takes_optiongroups = {
         "sambaopts": options.SambaOptions,
@@ -64,7 +64,14 @@ class cmd_domain_join(Command):
 
     takes_options = [
         Option("--no-dns-updates", action="store_true",
-               help="Disable DNS updates")
+               help="Disable DNS updates"),
+        Option("--parent-domain", type=str,
+               help="DNS name of the parent domain when creating a new "
+                    "child domain with the (EXPERIMENTAL) SUBDOMAIN role "
+                    "(default: <dnsdomain> without its first label)"),
+        Option("--adminpass", type="string", metavar="PASSWORD",
+               help="Administrator password of the new child domain "
+                    "(SUBDOMAIN role only, otherwise random)"),
     ]
     takes_options.extend(common_join_options)
     takes_options.extend(common_provision_join_options)
@@ -83,7 +90,8 @@ class cmd_domain_join(Command):
             use_ntvfs=False, experimental_s4_member=False, dns_backend=None,
             quiet=False, verbose=False, no_dns_updates=False,
             plaintext_secrets=False,
-            backend_store=None, backend_store_size=None):
+            backend_store=None, backend_store_size=None,
+            parent_domain=None, adminpass=None):
         lp = sambaopts.get_loadparm()
         creds = credopts.get_credentials(lp)
         net = Net(creds, lp, server=credopts.ipaddress)
@@ -142,5 +150,24 @@ class cmd_domain_join(Command):
                       plaintext_secrets=plaintext_secrets,
                       backend_store=backend_store,
                       backend_store_size=backend_store_size)
+        elif role == "SUBDOMAIN" and is_ad_dc_built():
+            logger.warning("Creating a child domain is EXPERIMENTAL: "
+                           "multi-domain forests are not fully supported "
+                           "by Samba yet")
+            if adminpass is None:
+                logger.info("Administrator password will be set randomly!")
+            netbios_domain = lp.get("workgroup")
+            if parent_domain is None:
+                parent_domain = ".".join(domain.split(".")[1:])
+            join_subdomain(logger=logger, server=server, creds=creds, lp=lp,
+                           dnsdomain=domain, parent_domain=parent_domain,
+                           site=site, netbios_name=netbios_name,
+                           netbios_domain=netbios_domain,
+                           targetdir=targetdir, machinepass=machinepass,
+                           use_ntvfs=use_ntvfs, dns_backend=dns_backend,
+                           adminpass=adminpass,
+                           plaintext_secrets=plaintext_secrets,
+                           backend_store=backend_store,
+                           backend_store_size=backend_store_size)
         else:
-            raise CommandError("Invalid role '%s' (possible values: MEMBER, DC, RODC)" % role)
+            raise CommandError("Invalid role '%s' (possible values: MEMBER, DC, RODC, SUBDOMAIN)" % role)
