@@ -1352,7 +1352,7 @@ class Partition(NamingContext):
                  "msDS-NC-RO-Replica-Locations"]
         try:
             res = samdb.search(base=self.partstr, scope=ldb.SCOPE_BASE,
-                               attrs=attrs)
+                               attrs=attrs, controls=["extended_dn:1:1"])
 
         except ldb.LdbError as e15:
             (enum, estr) = e15.args
@@ -1380,6 +1380,15 @@ class Partition(NamingContext):
 
                 if k == "nCName":
                     self.nc_dnstr = dnstr
+                    # The GUID and SID of the NC are also known
+                    # for the NCs we don't hold (e.g. the domain
+                    # NC of another domain of the forest)
+                    guid = dsdn.dn.get_extended_component("GUID")
+                    if guid is not None:
+                        self.nc_guid = ndr_unpack(misc.GUID, guid)
+                    sid = dsdn.dn.get_extended_component("SID")
+                    if sid is not None:
+                        self.nc_sid = sid
                     continue
 
                 if k == "msDS-NC-Replica-Locations":
