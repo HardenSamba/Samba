@@ -163,7 +163,14 @@ class dbcheck(object):
         self.system_session_info = system_session()
         self.admin_session_info = admin_session(None, samdb.get_domain_sid())
 
-        res = self.samdb.search(base=self.ntds_dsa, scope=ldb.SCOPE_BASE, attrs=['msDS-hasMasterNCs', 'hasMasterNCs'])
+        res = self.samdb.search(base=self.ntds_dsa, scope=ldb.SCOPE_BASE,
+                                attrs=['msDS-hasMasterNCs', 'hasMasterNCs',
+                                       'hasPartialReplicaNCs'])
+        # The partial (global catalog) replicas of the other domains
+        # of the forest: read-only, and only with the attributes of the
+        # partial attribute set.
+        self.partial_ncs = [str(x).lower() for x in
+                            res[0].get('hasPartialReplicaNCs', [])]
         if "msDS-hasMasterNCs" in res[0]:
             self.write_ncs = res[0]["msDS-hasMasterNCs"]
         else:
@@ -2311,6 +2318,12 @@ newSuperior: %s""" % (str(from_dn), str(to_rdn), str(to_base)))
 
         return False
 
+    def is_in_partial_nc(self, dn):
+        """Is dn in a partial (global catalog) replica of a domain NC?"""
+        if not self.partial_ncs:
+            return False
+        return str(self.samdb.get_nc_root(dn)).lower() in self.partial_ncs
+
     def calculate_instancetype(self, dn):
         instancetype = 0
         nc_root = self.samdb.get_nc_root(dn)
@@ -3026,8 +3039,13 @@ newSuperior: %s""" % (str(from_dn), str(to_rdn), str(to_base)))
                 self.err_no_fsmoRoleOwner(obj)
                 error_count += 1
 
+        # The NC head of a domain of the forest (other than the forest
+        # root) has no parent object when we don't hold the NC above it.
+        is_nc_head = ("instanceType" in obj and
+                      int(obj["instanceType"][0]) & dsdb.INSTANCE_TYPE_IS_NC_HEAD)
         try:
-            if dn != self.samdb.get_root_basedn() and str(dn.parent()) not in self.dn_set:
+            if dn != self.samdb.get_root_basedn() and not is_nc_head and \
+               str(dn.parent()) not in self.dn_set:
                 res = self.samdb.search(base=dn.parent(), scope=ldb.SCOPE_BASE,
                                         controls=["show_recycled:1", "show_deleted:1"])
         except ldb.LdbError as e11:
@@ -3043,7 +3061,8 @@ newSuperior: %s""" % (str(from_dn), str(to_rdn), str(to_base)))
             else:
                 raise
 
-        if dn in self.deleted_objects_containers and '*' in lc_attrs:
+        if dn in self.deleted_objects_containers and '*' in lc_attrs and \
+           not self.is_in_partial_nc(dn):
             if self.is_deleted_deleted_objects(obj):
                 self.err_deleted_deleted_objects(obj)
                 error_count += 1
