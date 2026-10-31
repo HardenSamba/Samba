@@ -87,6 +87,8 @@ class NamingContext(object):
 
         except ldb.LdbError as e:
             (enum, estr) = e.args
+            if enum == ldb.ERR_NO_SUCH_OBJECT and self.load_nc_from_crossref(samdb):
+                return
             raise KCCError("Unable to find naming context (%s) - (%s)" %
                            (self.nc_dnstr, estr))
         msg = res[0]
@@ -97,6 +99,45 @@ class NamingContext(object):
             self.nc_sid = msg["objectSid"][0]
 
         assert self.nc_guid is not None
+
+    def load_nc_from_crossref(self, samdb):
+        """Take the GUID and SID of a NC we don't hold (e.g. the domain NC
+        or the DomainDnsZones of another domain of our forest) from the
+        nCName of its crossRef.
+
+        :return: True if the crossRef was found
+        """
+        # A filter on the nCName of a NC we don't hold matches nothing,
+        # so we compare the DNs here.
+        try:
+            res = samdb.search(base=samdb.get_partitions_dn(),
+                               scope=ldb.SCOPE_ONELEVEL,
+                               expression="(objectClass=crossRef)",
+                               attrs=["nCName"],
+                               controls=["extended_dn:1:1"])
+        except ldb.LdbError:
+            return False
+
+        wanted = ldb.Dn(samdb, self.nc_dnstr)
+        nc_dn = None
+        for msg in res:
+            if "nCName" not in msg:
+                continue
+            dn = ldb.Dn(samdb, msg["nCName"][0].decode('utf8'))
+            if ldb.Dn(samdb, str(dn)) == wanted:
+                nc_dn = dn
+                break
+        if nc_dn is None:
+            return False
+
+        guid = nc_dn.get_extended_component("GUID")
+        if guid is None:
+            return False
+        self.nc_guid = ndr_unpack(misc.GUID, guid)
+        sid = nc_dn.get_extended_component("SID")
+        if sid is not None:
+            self.nc_sid = sid
+        return True
 
     def is_config(self):
         """Return True if NC is config"""
@@ -1450,12 +1491,16 @@ class Partition(NamingContext):
 
         # If the target dsa is a gc then a partial replica of a
         # domain NC (other than the DSAs default domain) should exist
-        # if there is also a cross reference for the DSA
+        # if there is also a cross reference for the DSA, or if the
+        # DSA lists it in its hasPartialReplicaNCs (the KCC of a GC adds
+        # the domain NCs of the forest there, see
+        # KCC.refresh_gc_partial_replicas())
         if (target_dsa.is_gc() and
             self.nc_type == NCType.domain and
             self.nc_dnstr != target_dsa.default_dnstr and
             (target_dsa.dsa_dnstr in self.ro_location_list or
-             target_dsa.dsa_dnstr in self.rw_location_list)):
+             target_dsa.dsa_dnstr in self.rw_location_list or
+             target_dsa.get_current_replica(self.nc_dnstr) is not None)):
             needed = True
             partial = True
 

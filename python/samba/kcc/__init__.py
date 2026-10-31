@@ -336,6 +336,76 @@ class KCC(object):
             part.load_partition(self.samdb)
             self.part_table[partstr] = part
 
+    def refresh_gc_partial_replicas(self):
+        """On a global catalog, make sure we hold a partial replica of the
+        domain NC of every other domain of the forest (hasPartialReplicaNCs
+        on our nTDSDSA object), so that the replication of their partial
+        attribute set gets set up.
+
+        :return: True if hasPartialReplicaNCs was changed
+        """
+        if not self.my_dsa.is_gc() or self.my_dsa.is_ro():
+            return False
+
+        wanted = set()
+        for part in self.part_table.values():
+            if part.nc_type != NCType.domain or not part.is_enabled():
+                continue
+            if part.nc_dnstr == self.my_dsa.default_dnstr:
+                continue
+            wanted.add(part.nc_dnstr)
+
+        res = self.samdb.search(base=self.my_dsa_dnstr, scope=ldb.SCOPE_BASE,
+                                attrs=["hasPartialReplicaNCs",
+                                       "hasMasterNCs", "msDS-hasMasterNCs"])
+        held = set()
+        for attr in ("hasPartialReplicaNCs", "hasMasterNCs",
+                     "msDS-hasMasterNCs"):
+            for value in res[0].get(attr, []):
+                held.add(str(ldb.Dn(self.samdb, value.decode('utf8'))).lower())
+
+        missing = []
+        for dnstr in sorted(wanted):
+            if dnstr.lower() in held:
+                continue
+            # The (uninstantiated) NC head of the partial replica is
+            # created with the crossRef of a new domain, when it is
+            # added or replicated to us. A domain that existed before
+            # this DC (e.g. the forest root, seen from a GC of a child
+            # domain) has none, and we can't add the replica yet.
+            try:
+                self.samdb.search(base=dnstr, scope=ldb.SCOPE_BASE,
+                                  attrs=["instanceType"])
+            except ldb.LdbError as e:
+                (enum, estr) = e.args
+                if enum != ldb.ERR_NO_SUCH_OBJECT:
+                    raise
+                DEBUG_FN("No NC head for the partial replica of %s, "
+                         "skipping it" % dnstr)
+                continue
+            missing.append(dnstr)
+
+        if not missing:
+            return False
+
+        DEBUG_FN("Adding partial replicas %s" % missing)
+        if self.readonly:
+            return False
+
+        m = ldb.Message()
+        m.dn = ldb.Dn(self.samdb, self.my_dsa_dnstr)
+        m["hasPartialReplicaNCs"] = ldb.MessageElement(missing,
+                                                       ldb.FLAG_MOD_ADD,
+                                                       "hasPartialReplicaNCs")
+        try:
+            self.samdb.modify(m)
+        except ldb.LdbError as e:
+            (enum, estr) = e.args
+            logger.warning("Failed to add the partial replicas %s: %s" %
+                           (missing, estr))
+            return False
+        return True
+
     def refresh_failed_links_connections(self, ping=None):
         """Ensure the failed links list is up to date
 
@@ -2264,11 +2334,16 @@ class KCC(object):
         # from rj of R to ri such that j != i, an edge from rj to ri
         # is not already in the graph, and the total edges directed
         # to ri is less than n+2, the KCC adds that edge to the graph.
+        #
+        # Only the DCs of R count: in a multi-domain forest, a DC of
+        # the site may hold no replica of NC (x) (it is in another
+        # domain) while having connections for the other NCs.
+        r_dsas = set(x.dsa_dnstr for x in graph_list)
         for vertex in graph_list:
             dsa = self.my_site.dsa_table[vertex.dsa_dnstr]
             for connect in dsa.connect_table.values():
                 remote = connect.from_dnstr
-                if remote in self.my_site.dsa_table:
+                if remote in r_dsas:
                     vertex.add_edge_from(remote)
 
         DEBUG('reps are:  %s' % '   '.join(x.rep_dsa_dnstr for x in r_list))
@@ -2548,6 +2623,10 @@ class KCC(object):
 
             self.load_all_sites()
             self.load_all_partitions()
+            if self.refresh_gc_partial_replicas():
+                # our replica tables changed
+                self.load_my_dsa()
+                self.load_all_sites()
             self.load_ip_transport()
             self.load_all_sitelinks()
 
