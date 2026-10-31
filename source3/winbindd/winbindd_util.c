@@ -1307,6 +1307,18 @@ static bool add_trusted_domains_dc(void)
 		struct winbindd_domain *routing_domain = NULL;
 		uint32_t fi;
 
+		if (domains[i]->trust_attributes &
+		    (LSA_TRUST_ATTRIBUTE_PIM_TRUST |
+		     LSA_TRUST_ATTRIBUTE_WITHIN_FOREST |
+		     LSA_TRUST_ATTRIBUTE_CROSS_ORGANIZATION))
+		{
+			/*
+			 * These were ignored above, so there's no
+			 * winbindd domain for them.
+			 */
+			continue;
+		}
+
 		routing_domain = find_domain_from_name_noinit(
 			domains[i]->netbios_name);
 		if (routing_domain == NULL) {
