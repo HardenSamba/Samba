@@ -16,7 +16,10 @@ DC. The original Samba README follows below, after the
 
 - Base: Samba `master` at commit `f6fddd2232c9` (4.26.0pre1, 2026-10-30)
 - Branch: `_Harden-Box-Multi-domains-supports-phase1`
-- 11 code commits + this documentation, all on top of the base commit
+- 11 code commits for the multi-domain work, 1 commit that makes the DC
+  advertise Active Directory Web Services (see
+  [ADWS advertisement](#active-directory-web-services-adws-advertisement)),
+  and this documentation, all on top of the base commit
 
 
 Context
@@ -135,6 +138,80 @@ These are the next phases of the work:
 - `subdom_dc` is not in `script/autobuild.py` yet.
 
 
+Active Directory Web Services (ADWS) advertisement
+--------------------------------------------------
+
+The HardenSamba ADWS service
+([HardenSamba/samba-adws](https://github.com/HardenSamba/samba-adws))
+answers on TCP 9389, but a Windows client only uses it if the domain
+controller says it has ADWS. That announcement is made by Samba itself,
+so this branch carries it in the source code (it used to be shipped as
+`patches/samba/0001-advertise-adws-in-the-cldap-netlogon-response.patch`
+in samba-adws, branch `fix/get-forwards-visibility-controls`, commit
+`33e56b9`; no patch is needed any more).
+
+How it works:
+
+- A client looking for an ADWS controller (the Active Directory
+  Administrative Center, or the ActiveDirectory PowerShell module used
+  without `-Server`) calls `DsGetDcName` with `DS_WEB_SERVICE_REQUIRED`
+  (`0x00100000`, sent by the client).
+- The locator only keeps the controllers whose CLDAP netlogon response
+  has `DS_SERVER_WEBSERV` (`0x00002000`, also named
+  `NBT_SERVER_ADS_WEB_SERVICE`) in `server_type`. Samba never set it.
+- `fill_netlogon_samlogon_response()`
+  (`source4/dsdb/samdb/ldb_modules/netlogon.c`) now sets it when
+  `smb.conf` says so. That function builds the answer of the CLDAP ping
+  (UDP 389) and of the rootDSE `netlogon` attribute (`rootdse.c`), of the
+  NetBIOS mailslot (`nbt_server`) and of the Netlogon RPC server.
+
+Enable it only on a DC where the ADWS service runs on 9389:
+
+```ini
+[global]
+    adws:advertise = yes
+```
+
+It is **off by default**: a controller announcing ADWS with nothing
+listening on 9389 is worse than one that stays quiet, as the client
+connects to it and fails instead of looking elsewhere. It is a generic
+(parametric) parameter, so no IDL, parameter table or documentation
+regeneration is needed. Restart samba after changing it.
+
+Checking it, on the DC (the `server_type` of its own netlogon reply):
+
+| `adws:advertise` | `server_type` | `DS_SERVER_WEBSERV` (0x2000) |
+|---|---|---|
+| absent or `no` | `0x000013fd` | not set |
+| `yes` | `0x000033fd` | set |
+
+(values measured on this branch on a freshly provisioned domain, the same
+as the ones measured with the samba-adws patch on Samba 4.17 and 4.22)
+
+```python
+from samba.credentials import Credentials
+from samba.dcerpc import nbt
+from samba.net import Net
+from samba.param import LoadParm
+
+lp = LoadParm(); lp.load_default()
+creds = Credentials(); creds.guess(lp)
+reply = Net(creds=creds, lp=lp).finddc(address="127.0.0.1",
+                                       flags=nbt.NBT_SERVER_LDAP | nbt.NBT_SERVER_DS)
+print("0x%08x" % reply.server_type,
+      bool(reply.server_type & nbt.NBT_SERVER_ADS_WEB_SERVICE))
+```
+
+And on a joined Windows client (`/force` bypasses the locator cache):
+
+```
+nltest /dsgetdc:<REALM> /ws /force
+```
+
+which returns the controller with `WS` in its flags, instead of
+`ERROR_NO_SUCH_DOMAIN` (1355) when the announcement is off.
+
+
 Changes in detail
 -----------------
 
@@ -151,6 +228,7 @@ Changes in detail
 | 9 | `python:provision: fix the provision of a child domain (FILL_SUBDOMAIN)` | `source4/setup/provision_users.ldif`, `source4/setup/provision_users_forest_root.ldif` (new), `source4/setup/provision_users_forest_root_modify.ldif` (new), `python/samba/provision/__init__.py`, `python/samba/provision/sambadns.py`, `python/samba/descriptor.py` | The forest root groups (and their memberships) moved to their own LDIF files, only used for the forest root (`FILL_FULL`). The descriptors of the domain NC objects are rewritten with the forest root SID (`fix_forest_root_sids()`). Fixed a `NameError` (`managedservice_descr`) with `FILL_SUBDOMAIN`. The crossRef of DomainDnsZones (Configuration NC) is created as system, as the Administrator of a child domain has no rights there. No change for `FILL_FULL` and `FILL_DRS`. |
 | 10 | `samba-tool domain join: restore the SUBDOMAIN role (EXPERIMENTAL)` | `python/samba/join.py`, `python/samba/netcmd/domain/join.py` | `join_subdomain()`, `get_naming_master()` and the `SUBDOMAIN` role are back, with `--parent-domain` and `--adminpass`. Fixed: the trust is with the parent domain (not the forest root) on the parent DC; GUID and SID of the new domain in the nCName; nothing touched in the parent domain NC (machine account, DFSR topology, RID manager); DomainDnsZones not listed in the nTDSDSA object; LSA over named pipes; full LMDB map size for the new domain; local trust account created with the LSA control; DNS delegation and `_msdcs` CNAME; the exception is reported before the cleanup of a failed join. |
 | 11 | `selftest: add the subdom_dc environment and samba.tests.subdomain` | `selftest/target/Samba4.pm`, `selftest/target/Samba.pm`, `source4/selftest/tests.py`, `python/samba/tests/subdomain.py` (new) | The `subdom_dc` environment is back (removed in 2019), with the `SUBDOM_DC_SERVER` and `PARENT_*` variables, and `samba.tests.subdomain` checks the result of the join on both DCs (6 tests). |
+| 12 | `s4:dsdb:netlogon: advertise Active Directory Web Services` | `source4/dsdb/samdb/ldb_modules/netlogon.c` | Sets `DS_SERVER_WEBSERV` in the `server_type` of the netlogon response when `smb.conf` has `adws:advertise = yes` (off by default), so that Windows clients find the HardenSamba ADWS service through the DC locator. Taken from the samba-adws patch, see [ADWS advertisement](#active-directory-web-services-adws-advertisement). Independent of the multi-domain work: it touches no file changed by commits 1 to 11. |
 
 
 Testing
@@ -182,6 +260,9 @@ Results on this branch:
   `samba4.drs.repl_secdesc` / `samba4.drs.repl_move` on `vampire_dc`
   (a second DC of the parent domain, with a child domain already in the
   forest).
+- ADWS advertisement: `samba.tests.getdcname` (which checks that the
+  bit is off by default) OK, and the `server_type` table above measured
+  with `adws:advertise` absent, `no` and `yes`.
 - The full Samba test suite was not run.
 
 
