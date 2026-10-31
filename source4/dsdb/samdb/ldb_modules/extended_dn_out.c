@@ -145,8 +145,124 @@ struct extended_search_context {
 	bool remove_guid;
 	bool remove_sid;
 	int extended_type;
+	/* the NCs, loaded on demand by dn_in_local_nc() */
+	bool nc_list_loaded;
+	struct ldb_message_element *local_ncs;
+	struct ldb_result *forest_ncs;
 };
 
+/*
+ * Is dn within one of the naming contexts we hold?
+ *
+ * A one-way link (e.g. the nCName of the crossRef of another domain of
+ * our forest, or the msDS-hasMasterNCs of a DC of another domain)
+ * can point to an object of a NC we don't hold. Such a reference is
+ * valid (Windows keeps a phantom for it), so it must not be treated
+ * as a link to a deleted object.
+ *
+ * As the NC of a child domain is below the NC of its parent domain,
+ * we look for the most specific NC of the forest (from the crossRef
+ * objects) containing dn, and check if we hold it.
+ */
+static bool dn_in_local_nc(struct extended_search_context *ac,
+			   struct ldb_dn *dn)
+{
+	struct ldb_context *ldb = ldb_module_get_ctx(ac->module);
+	struct ldb_dn *best_nc = NULL;
+	unsigned int i;
+	bool local = false;
+
+	if (!ac->nc_list_loaded) {
+		static const char * const root_attrs[] = {
+			"namingContexts", NULL
+		};
+		static const char * const xref_attrs[] = { "nCName", NULL };
+		struct ldb_result *res = NULL;
+		struct ldb_dn *partitions_dn = NULL;
+		int ret;
+
+		ac->nc_list_loaded = true;
+		ret = dsdb_module_search_dn(ac->module, ac, &res,
+					    ldb_dn_new(ac, ldb, ""),
+					    root_attrs,
+					    DSDB_FLAG_TOP_MODULE |
+					    DSDB_FLAG_AS_SYSTEM,
+					    ac->req);
+		if (ret == LDB_SUCCESS && res->count == 1) {
+			ac->local_ncs = ldb_msg_find_element(res->msgs[0],
+							     "namingContexts");
+		}
+
+		/*
+		 * Below us, so we get the stored nCName values (and
+		 * don't come back here)
+		 */
+		partitions_dn = samdb_partitions_dn(ldb, ac);
+		if (partitions_dn != NULL) {
+			ret = dsdb_module_search(ac->module, ac,
+						 &ac->forest_ncs,
+						 partitions_dn,
+						 LDB_SCOPE_ONELEVEL,
+						 xref_attrs,
+						 DSDB_FLAG_NEXT_MODULE |
+						 DSDB_FLAG_AS_SYSTEM,
+						 ac->req,
+						 "(objectClass=crossRef)");
+			if (ret != LDB_SUCCESS) {
+				ac->forest_ncs = NULL;
+			}
+		}
+	}
+
+	if (ac->local_ncs == NULL || ac->forest_ncs == NULL) {
+		/*
+		 * We don't know, keep the old behaviour (treat it as
+		 * local)
+		 */
+		return true;
+	}
+
+	for (i = 0; i < ac->forest_ncs->count; i++) {
+		const struct ldb_val *v = ldb_msg_find_ldb_val(
+			ac->forest_ncs->msgs[i], "nCName");
+		struct ldb_dn *nc = NULL;
+
+		if (v == NULL) {
+			continue;
+		}
+		nc = ldb_dn_from_ldb_val(ac, ldb, v);
+		if (nc == NULL || !ldb_dn_validate(nc)) {
+			continue;
+		}
+		if (ldb_dn_compare_base(nc, dn) != 0) {
+			continue;
+		}
+		if (best_nc == NULL ||
+		    ldb_dn_get_comp_num(nc) > ldb_dn_get_comp_num(best_nc)) {
+			best_nc = nc;
+		}
+	}
+
+	if (best_nc == NULL) {
+		/* not in any NC of the forest, keep the old behaviour */
+		return true;
+	}
+
+	for (i = 0; i < ac->local_ncs->num_values; i++) {
+		struct ldb_dn *nc = ldb_dn_from_ldb_val(
+			ac, ldb, &ac->local_ncs->values[i]);
+
+		if (nc != NULL && ldb_dn_compare(nc, best_nc) == 0) {
+			local = true;
+		}
+		TALLOC_FREE(nc);
+		if (local) {
+			break;
+		}
+	}
+
+	return local;
+}
 
 /*
    fix one-way links to have the right string DN, to cope with
@@ -186,9 +302,16 @@ static int fix_one_way_link(struct extended_search_context *ac, struct ldb_dn *d
 				 search_flags, ac->req, "objectguid=%s", GUID_string(tmp_ctx, &guid));
 	if (ret != LDB_SUCCESS || res->count != 1) {
 		/* if we can't resolve this GUID, then we don't
-		   display the link. This could be a link to a NC that we don't
-		   have, or it could be a link to a deleted object
+		   display the link, if it is a link to a deleted object.
+
+		   If it is a link to a NC that we don't have (another
+		   domain of our forest), we show the stored DN, as
+		   Windows does with its phantoms.
 		*/
+		if (!dn_in_local_nc(ac, dn)) {
+			talloc_free(tmp_ctx);
+			return LDB_SUCCESS;
+		}
 		(*remove_value) = true;
 		talloc_free(tmp_ctx);
 		return LDB_SUCCESS;
