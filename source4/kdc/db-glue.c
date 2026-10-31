@@ -3161,14 +3161,11 @@ static krb5_error_code samba_kdc_trust_message2entry(krb5_context context,
 		goto out;
 	}
 
-	if (tdo->trust_attributes & LSA_TRUST_ATTRIBUTE_WITHIN_FOREST) {
-		/*
-		 * We don't support WITHIN_FOREST yet
-		 */
-		krb5_clear_error_message(context);
-		ret = SDB_ERR_NOENTRY;
-		goto out;
-	}
+	/*
+	 * LSA_TRUST_ATTRIBUTE_WITHIN_FOREST (parent-child trust inside
+	 * our forest) works like the other uplevel trusts here: the
+	 * inter-realm keys come from trustAuthIncoming/Outgoing.
+	 */
 
 	if (tdo->trust_attributes & LSA_TRUST_ATTRIBUTE_PIM_TRUST) {
 		/*
@@ -4513,24 +4510,40 @@ static krb5_error_code samba_kdc_lookup_realm(krb5_context context,
 	}
 
 	if (tdo->trust_attributes & LSA_TRUST_ATTRIBUTE_WITHIN_FOREST) {
+		const struct dom_sid *our_sid = samdb_domain_sid(kdc_db_ctx->samdb);
+
+		if (our_sid != NULL && tdo->sid != NULL &&
+		    dom_sid_equal(our_sid, tdo->sid))
+		{
+			/*
+			 * This is our own domain
+			 */
+			TALLOC_FREE(frame);
+			return 0;
+		}
+
 		/*
-		 * TODO: handle the routing within the forest
+		 * Another domain of our forest, reached through
+		 * a parent-child trust.
 		 *
-		 * This should likely be handled in
-		 * samba_kdc_message2entry() in case we're
-		 * a global catalog. We'd need to check
-		 * if realm_dn is our own domain and derive
-		 * the dns domain name from realm_dn and check that
-		 * against the routing table or fallback to
-		 * the tdo we found here.
-		 *
-		 * But for now we don't support multiple domains
-		 * in our forest correctly anyway.
-		 *
-		 * Just search in our local database.
+		 * The domains of a forest share their namespace
+		 * (e.g. all the DRS SPNs use the _msdcs zone of the
+		 * forest root), so a server principal that exists
+		 * here stays ours, only the others are referred to
+		 * the next domain on the way to theirs.
 		 */
-		TALLOC_FREE(frame);
-		return 0;
+		if (flags & SDB_F_GET_SERVER) {
+			struct ldb_dn *realm_dn = NULL;
+			struct ldb_message *msg = NULL;
+
+			ret = samba_kdc_lookup_server(context, kdc_db_ctx,
+						      frame, principal,
+						      flags, &realm_dn, &msg);
+			if (ret == 0) {
+				TALLOC_FREE(frame);
+				return 0;
+			}
+		}
 	}
 
 	ret = krb5_copy_principal(context, principal,

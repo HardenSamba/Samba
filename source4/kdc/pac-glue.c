@@ -3379,7 +3379,16 @@ krb5_error_code samba_kdc_get_claims_data(TALLOC_CTX *mem_ctx,
 		return code;
 	}
 
-	if (was_found && samba_kdc_entry_pac_issued_by_trust(entry)) {
+	if (was_found && samba_kdc_entry_pac_issued_by_trust(entry) &&
+	    !(ldb_msg_find_attr_as_uint(entry.krbtgt->msg,
+					"trustAttributes", 0) &
+	      LSA_TRUST_ATTRIBUTE_WITHIN_FOREST))
+	{
+		/*
+		 * Claims are only transformed (or cleared) when they
+		 * cross a forest boundary, the domains of a forest
+		 * share their claim definitions.
+		 */
 		const char *tdo_attr = "msDS-IngressClaimsTransformationPolicy";
 		struct claims_tf_rule_set *rule_set = NULL;
 		NTSTATUS status;
