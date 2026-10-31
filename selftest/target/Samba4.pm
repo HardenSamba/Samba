@@ -2793,11 +2793,25 @@ sub setup_subdom_dc
 			return undef;
 		}
 
-		# TODO: once DC to DC authentication across the
-		# intra-forest trust works (Kerberos referrals in the
-		# KDC, NTLM pass-through in winbindd), force the
-		# replication of the Configuration NC in both
-		# directions here, as setup_generic_vampire_dc() does.
+		# Replicate the Configuration NC in both directions
+		# between the two domains (the DCs authenticate to each
+		# other with Kerberos across the parent-child trust).
+		my $samba_tool =  Samba::bindir_path($self, "samba-tool");
+		my $config_dn = "CN=Configuration,DC=" .
+			join(",DC=", split(/\./, $dc_vars->{REALM}));
+		my $creds = " -U$dc_vars->{DC_USERNAME}\@$dc_vars->{REALM}\%$dc_vars->{DC_PASSWORD}";
+
+		foreach my $pair ([$env->{SERVER}, $dc_vars->{SERVER}],
+				  [$dc_vars->{SERVER}, $env->{SERVER}]) {
+			my ($dest, $source) = @{$pair};
+			my $cmd = $self->get_cmd_env_vars($env);
+			$cmd .= " $samba_tool drs replicate $dest $source";
+			$cmd .= " \"$config_dn\" $env->{CONFIGURATION} $creds";
+			unless (system($cmd) == 0) {
+				warn("Failed to replicate\n$cmd");
+				return undef;
+			}
+		}
 	}
 
 	return $env;

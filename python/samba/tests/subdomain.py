@@ -23,18 +23,21 @@ domain (sub.samba.example.com) joined with
 'samba-tool domain join ... SUBDOMAIN' to the forest of ad_dc_ntvfs
 (samba.example.com).
 
-They check the state the join leaves behind on both sides. Things
-that are known not to work yet (Kerberos and NTLM across the
-intra-forest trust, LSA lookups, the global catalog) are not tested
-here yet.
+They check the state the join leaves behind on both sides, and that
+the two domains work together across the intra-forest trust:
+Kerberos referrals, NTLM pass-through, LSA name and SID lookups, the
+forest root groups in the child domain, DRS replication in both
+directions and the partial replica of the child domain on the global
+catalog of the forest root.
 """
 
 import ldb
 import samba
-from samba import dsdb
+from samba import dsdb, drs_utils
 from samba.auth import system_session
-from samba.credentials import Credentials
-from samba.dcerpc import lsa, security
+from samba.credentials import (Credentials, DONT_USE_KERBEROS,
+                               MUST_USE_KERBEROS)
+from samba.dcerpc import drsuapi, lsa, security
 from samba.ndr import ndr_unpack
 from samba.samdb import SamDB
 from samba.tests import TestCase, env_get_var_value, env_loadparm
@@ -46,33 +49,62 @@ class SubdomainTests(TestCase):
         super().setUp()
         self.lp = env_loadparm()
 
-        # The child domain DC, with the Administrator of the child domain
+        # The child domain DC and its Administrator
         self.child_server = env_get_var_value("SUBDOM_DC_SERVER")
-        child_creds = Credentials()
-        child_creds.guess(self.lp)
-        child_creds.set_username(env_get_var_value("USERNAME"))
-        child_creds.set_password(env_get_var_value("PASSWORD"))
-        child_creds.set_domain(env_get_var_value("DOMAIN"))
-        self.child = SamDB(url="ldap://%s" % self.child_server,
-                           session_info=system_session(),
-                           credentials=child_creds, lp=self.lp)
+        self.child_realm = env_get_var_value("REALM")
+        self.child_domain = env_get_var_value("DOMAIN")
+        self.child_fqdn = "%s.%s" % (self.child_server,
+                                     self.child_realm.lower())
+        self.child_account = (env_get_var_value("USERNAME"),
+                              env_get_var_value("PASSWORD"),
+                              self.child_domain,
+                              self.child_realm)
 
-        # The parent (forest root) domain DC, with its Administrator
+        # The parent (forest root) domain DC and its Administrator
         self.parent_server = env_get_var_value("PARENT_SERVER")
-        parent_creds = Credentials()
-        parent_creds.guess(self.lp)
-        parent_creds.set_username(env_get_var_value("PARENT_USERNAME"))
-        parent_creds.set_password(env_get_var_value("PARENT_PASSWORD"))
-        parent_creds.set_domain(env_get_var_value("PARENT_DOMAIN"))
-        parent_creds.set_realm(env_get_var_value("PARENT_REALM"))
-        self.parent = SamDB(url="ldap://%s" % self.parent_server,
-                            session_info=system_session(),
-                            credentials=parent_creds, lp=self.lp)
+        self.parent_realm = env_get_var_value("PARENT_REALM")
+        self.parent_domain = env_get_var_value("PARENT_DOMAIN")
+        self.parent_fqdn = "%s.%s" % (self.parent_server,
+                                      self.parent_realm.lower())
+        self.parent_account = (env_get_var_value("PARENT_USERNAME"),
+                               env_get_var_value("PARENT_PASSWORD"),
+                               self.parent_domain,
+                               self.parent_realm)
+
+        self.child = self._connect(self.child_fqdn, self.child_account)
+        self.parent = self._connect(self.parent_fqdn, self.parent_account)
 
         self.child_dn = self.child.get_default_basedn()
         self.parent_dn = self.parent.get_default_basedn()
         self.child_sid = security.dom_sid(self.child.get_domain_sid())
         self.parent_sid = security.dom_sid(self.parent.get_domain_sid())
+
+    def _creds(self, account, kerberos_state=None):
+        (username, password, domain, realm) = account
+        creds = Credentials()
+        creds.guess(self.lp)
+        creds.set_username(username)
+        creds.set_password(password)
+        creds.set_domain(domain)
+        creds.set_realm(realm)
+        if kerberos_state is not None:
+            creds.set_kerberos_state(kerberos_state)
+        return creds
+
+    def _connect(self, host, account, kerberos_state=None, port=None):
+        url = "ldap://%s" % host
+        if port is not None:
+            url += ":%d" % port
+        return SamDB(url=url,
+                     session_info=system_session(),
+                     credentials=self._creds(account, kerberos_state),
+                     lp=self.lp)
+
+    def _token_sids(self, samdb):
+        res = samdb.search(base="", scope=ldb.SCOPE_BASE,
+                           attrs=["tokenGroups"])
+        return [str(ndr_unpack(security.dom_sid, v))
+                for v in res[0]["tokenGroups"]]
 
     def _crossref(self, samdb, nc_dn):
         res = samdb.search(base=samdb.get_partitions_dn(),
@@ -205,3 +237,211 @@ class SubdomainTests(TestCase):
                 return False
             raise
         return True
+
+    def _cross_domain_binds(self, kerberos_state):
+        """Each Administrator binds to the DC of the other domain, and is
+        known there as a member of the Domain Users of its own domain"""
+        for account, sid in ((self.child_account, self.child_sid),
+                             (self.parent_account, self.parent_sid)):
+            for host in (self.child_fqdn, self.parent_fqdn):
+                samdb = self._connect(host, account, kerberos_state)
+                self.assertIn("%s-%d" % (sid, security.DOMAIN_RID_USERS),
+                              self._token_sids(samdb),
+                              "%s\\%s on %s" % (account[2], account[0], host))
+
+    def test_kerberos_cross_domain(self):
+        """Kerberos works in both directions across the intra-forest
+        trust (cross-realm referrals of the KDCs)"""
+        self._cross_domain_binds(MUST_USE_KERBEROS)
+
+    def test_ntlm_cross_domain(self):
+        """NTLM works in both directions across the intra-forest trust
+        (pass-through authentication through winbindd and netlogon)"""
+        self._cross_domain_binds(DONT_USE_KERBEROS)
+
+    def _member_sids(self, samdb, dn):
+        res = samdb.search(base=dn, scope=ldb.SCOPE_BASE,
+                           attrs=["member"], controls=["extended_dn:1:1"])
+        sids = []
+        for m in res[0].get("member", []):
+            sid = ldb.Dn(samdb, str(m)).get_extended_component("SID")
+            if sid is not None:
+                sids.append(str(ndr_unpack(security.dom_sid, sid)))
+        return sids
+
+    def test_forest_root_memberships(self):
+        """The join of the child domain made the forest root groups
+        members of its Administrators and of its Denied RODC Password
+        Replication Group"""
+        ea = "%s-%d" % (self.parent_sid, security.DOMAIN_RID_ENTERPRISE_ADMINS)
+        sa = "%s-%d" % (self.parent_sid, security.DOMAIN_RID_SCHEMA_ADMINS)
+
+        admins = self._member_sids(self.child,
+                                   "CN=Administrators,CN=Builtin,%s" %
+                                   self.child_dn)
+        self.assertIn(ea, admins)
+
+        denied = self._member_sids(self.child,
+                                   "CN=Denied RODC Password Replication Group,"
+                                   "CN=Users,%s" % self.child_dn)
+        self.assertIn(ea, denied)
+        self.assertIn(sa, denied)
+
+    def test_forest_root_admin_token(self):
+        """On a DC of the child domain, the Administrator of the forest root
+        domain is a member of Enterprise Admins and, through it, of the
+        Administrators of the child domain"""
+        for kerberos_state in (MUST_USE_KERBEROS, DONT_USE_KERBEROS):
+            samdb = self._connect(self.child_fqdn, self.parent_account,
+                                  kerberos_state)
+            sids = self._token_sids(samdb)
+            self.assertIn("%s-%d" % (self.parent_sid,
+                                     security.DOMAIN_RID_ENTERPRISE_ADMINS),
+                          sids)
+            self.assertIn(security.SID_BUILTIN_ADMINISTRATORS, sids)
+
+    def _lsa(self, host, account):
+        conn = lsa.lsarpc("ncacn_np:%s[seal]" % host, self.lp,
+                          self._creds(account))
+        attr = lsa.ObjectAttribute()
+        attr.sec_qos = lsa.QosInfo()
+        handle = conn.OpenPolicy2('', attr, security.SEC_FLAG_MAXIMUM_ALLOWED)
+        return conn, handle
+
+    def _lookup_name(self, conn, handle, name):
+        string = lsa.String()
+        string.string = name
+        sids = lsa.TransSidArray()
+        (domains, sids, count) = conn.LookupNames(handle, [string], sids,
+                                                  lsa.LSA_LOOKUP_NAMES_ALL, 0)
+        self.assertEqual(count, 1, name)
+        item = sids.sids[0]
+        domain = domains.domains[item.sid_index]
+        return (item.sid_type, str(domain.sid), item.rid,
+                domain.name.string)
+
+    def _lookup_sid(self, conn, handle, sid):
+        ptr = lsa.SidPtr()
+        ptr.sid = security.dom_sid(sid)
+        sids = lsa.SidArray()
+        sids.sids = [ptr]
+        sids.num_sids = 1
+        names = lsa.TransNameArray()
+        (domains, names, count) = conn.LookupSids(handle, sids, names,
+                                                  lsa.LSA_LOOKUP_NAMES_ALL, 0)
+        self.assertEqual(count, 1, sid)
+        item = names.names[0]
+        return (item.sid_type, item.name.string,
+                domains.domains[item.sid_index].name.string)
+
+    def test_lsa_lookups_cross_domain(self):
+        """Both DCs resolve the names and the SIDs of both domains of the
+        forest: NT4 names, UPNs, domain names"""
+        domains = ((self.child_domain, self.child_realm, self.child_sid),
+                   (self.parent_domain, self.parent_realm, self.parent_sid))
+        for host, account in ((self.child_fqdn, self.child_account),
+                              (self.parent_fqdn, self.parent_account)):
+            conn, handle = self._lsa(host, account)
+            for netbios, realm, sid in domains:
+                where = "%s on %s" % (netbios, host)
+                for name in ("%s\\Administrator" % netbios,
+                             "Administrator@%s" % realm.lower()):
+                    self.assertEqual(self._lookup_name(conn, handle, name),
+                                     (lsa.SID_NAME_USER, str(sid),
+                                      security.DOMAIN_RID_ADMINISTRATOR,
+                                      netbios),
+                                     "%s on %s" % (name, host))
+
+                (sid_type, dom_sid, rid, dom_name) = \
+                    self._lookup_name(conn, handle, "%s\\" % netbios)
+                self.assertEqual((sid_type, dom_sid, dom_name),
+                                 (lsa.SID_NAME_DOMAIN, str(sid), netbios),
+                                 where)
+
+                self.assertEqual(
+                    self._lookup_sid(conn, handle, "%s-%d" % (
+                        sid, security.DOMAIN_RID_ADMINS)),
+                    (lsa.SID_NAME_DOM_GRP, "Domain Admins", netbios),
+                    where)
+
+    def _dsa_guid(self, samdb):
+        res = samdb.search(base="", scope=ldb.SCOPE_BASE,
+                           attrs=["dsServiceName"])
+        dn = str(res[0]["dsServiceName"][0])
+        res = samdb.search(base=dn, scope=ldb.SCOPE_BASE,
+                           attrs=["objectGUID"])
+        return res[0]["objectGUID"][0]
+
+    def _replicate(self, dest_fqdn, source, nc_dn):
+        """DsReplicaSync on dest_fqdn of nc_dn from the source DSA, as the
+        Administrator of the forest root domain"""
+        (drs, handle, _) = drs_utils.drsuapi_connect(
+            dest_fqdn, self.lp, self._creds(self.parent_account))
+        drs_utils.sendDsReplicaSync(drs, handle, self._dsa_guid(source),
+                                    str(nc_dn), drsuapi.DRSUAPI_DRS_WRIT_REP)
+        return drs, handle
+
+    def test_replication_cross_domain(self):
+        """The Configuration NC replicates in both directions between the
+        DCs of the two domains"""
+        config_dn = self.parent.get_config_basedn()
+        self._replicate(self.child_fqdn, self.parent, config_dn)
+        self._replicate(self.parent_fqdn, self.child, config_dn)
+
+    def test_global_catalog(self):
+        """The KCC of the forest root DC, a global catalog, adds a partial
+        replica of the child domain, which replicates and is searchable
+        over the global catalog port"""
+        (drs, handle) = self._replicate(self.parent_fqdn, self.child,
+                                        self.parent.get_config_basedn())
+        drs.DsExecuteKCC(handle, 1, drsuapi.DsExecuteKCC1())
+
+        res = self.parent.search(base=self.parent.get_dsServiceName(),
+                                 scope=ldb.SCOPE_BASE,
+                                 attrs=["options", "hasPartialReplicaNCs"])
+        options = int(res[0].get("options", idx=0) or 0)
+        self.assertTrue(options & dsdb.DS_NTDSDSA_OPT_IS_GC)
+        partial = [str(v).lower() for v in res[0].get("hasPartialReplicaNCs", [])]
+        self.assertIn(str(self.child_dn).lower(), partial)
+
+        self._replicate(self.parent_fqdn, self.child, self.child_dn)
+
+        gc = self._connect(self.parent_fqdn, self.parent_account, port=3268)
+
+        # The NC head is instantiated: a partial (read-only) replica
+        res = gc.search(base=self.child_dn, scope=ldb.SCOPE_BASE,
+                        attrs=["instanceType"])
+        self.assertEqual(int(res[0]["instanceType"][0]),
+                         dsdb.INSTANCE_TYPE_IS_NC_HEAD |
+                         dsdb.INSTANCE_TYPE_NC_ABOVE)
+
+        # Both Administrators are found from the root of the forest
+        res = gc.search(base="", scope=ldb.SCOPE_SUBTREE,
+                        expression="(&(objectClass=user)"
+                        "(sAMAccountName=Administrator))",
+                        attrs=["objectSid"])
+        sids = sorted(str(ndr_unpack(security.dom_sid, m["objectSid"][0]))
+                      for m in res)
+        self.assertEqual(sids, sorted(["%s-%d" % (s, security.DOMAIN_RID_ADMINISTRATOR)
+                                       for s in (self.child_sid, self.parent_sid)]))
+
+    def _connections_from(self, samdb):
+        """The fromServer of the nTDSConnection objects of the DSA of
+        samdb"""
+        res = samdb.search(base=samdb.get_dsServiceName(),
+                           scope=ldb.SCOPE_ONELEVEL,
+                           expression="(objectClass=nTDSConnection)",
+                           attrs=["fromServer"])
+        return [str(m["fromServer"][0]).lower() for m in res]
+
+    def test_kcc_cross_domain(self):
+        """The KCC runs on the DCs of both domains, and each one creates a
+        connection from the DC of the other domain (they share the
+        Configuration and Schema NCs)"""
+        for samdb, fqdn, other in ((self.child, self.child_fqdn, self.parent),
+                                   (self.parent, self.parent_fqdn, self.child)):
+            (drs, handle, _) = drs_utils.drsuapi_connect(
+                fqdn, self.lp, self._creds(self.parent_account))
+            drs.DsExecuteKCC(handle, 1, drsuapi.DsExecuteKCC1())
+            self.assertIn(str(other.get_dsServiceName()).lower(),
+                          self._connections_from(samdb), fqdn)
