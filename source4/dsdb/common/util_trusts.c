@@ -2875,6 +2875,35 @@ const struct lsa_TrustDomainInfoInfoEx *dsdb_trust_routing_by_name(
 		return NULL;
 	}
 
+	/*
+	 * The names of our own domain and of the domains of our forest
+	 * we have a direct (parent-child) trust with win, before the
+	 * forest information of the trust towards the forest root,
+	 * which also lists them (but routes them all to the root).
+	 */
+	for (d = table->domains; d != NULL; d = d->next) {
+		int cmp;
+
+		if (d->tdo->trust_type != LSA_TRUST_TYPE_UPLEVEL) {
+			continue;
+		}
+		if (!(d->tdo->trust_attributes &
+		      LSA_TRUST_ATTRIBUTE_WITHIN_FOREST)) {
+			continue;
+		}
+
+		cmp = dns_cmp(name, d->tdo->domain_name.string);
+		if (cmp == DNS_CMP_MATCH) {
+			return d->tdo;
+		}
+		if (d->tdo->netbios_name.string != NULL) {
+			cmp = dns_cmp(name, d->tdo->netbios_name.string);
+			if (cmp == DNS_CMP_MATCH) {
+				return d->tdo;
+			}
+		}
+	}
+
 	for (d = table->domains; d != NULL; d = d->next) {
 		bool transitive = false;
 		bool allow_netbios = false;
@@ -3062,6 +3091,29 @@ const struct lsa_TrustDomainInfoInfoEx *dsdb_trust_domain_by_sid(
 		return NULL;
 	}
 
+	/*
+	 * Our own domain and the domains of our forest we have a
+	 * direct (parent-child) trust with win, before the forest
+	 * information of the trust towards the forest root.
+	 */
+	for (d = table->domains; d != NULL; d = d->next) {
+		if (d->tdo->trust_type != LSA_TRUST_TYPE_UPLEVEL) {
+			continue;
+		}
+		if (!(d->tdo->trust_attributes &
+		      LSA_TRUST_ATTRIBUTE_WITHIN_FOREST)) {
+			continue;
+		}
+		if (d->di.domain_sid == NULL ||
+		    !dom_sid_equal(d->di.domain_sid, sid)) {
+			continue;
+		}
+		if (pdi != NULL) {
+			*pdi = &d->di;
+		}
+		return d->tdo;
+	}
+
 	for (d = table->domains; d != NULL; d = d->next) {
 		bool transitive = false;
 		uint32_t i;
@@ -3156,6 +3208,38 @@ const struct lsa_TrustDomainInfoInfoEx *dsdb_trust_domain_by_name(
 
 	if (name == NULL) {
 		return NULL;
+	}
+
+	/*
+	 * Our own domain and the domains of our forest we have a
+	 * direct (parent-child) trust with win, before the forest
+	 * information of the trust towards the forest root.
+	 */
+	for (d = table->domains; d != NULL; d = d->next) {
+		bool match = false;
+
+		if (d->tdo->trust_type != LSA_TRUST_TYPE_UPLEVEL) {
+			continue;
+		}
+		if (!(d->tdo->trust_attributes &
+		      LSA_TRUST_ATTRIBUTE_WITHIN_FOREST)) {
+			continue;
+		}
+		if (d->di.netbios_domain_name.string != NULL) {
+			match = strequal_m(d->di.netbios_domain_name.string,
+					   name);
+		}
+		if (!match && d->di.dns_domain_name.string != NULL) {
+			match = strequal_m(d->di.dns_domain_name.string,
+					   name);
+		}
+		if (!match) {
+			continue;
+		}
+		if (pdi != NULL) {
+			*pdi = &d->di;
+		}
+		return d->tdo;
 	}
 
 	for (d = table->domains; d != NULL; d = d->next) {
