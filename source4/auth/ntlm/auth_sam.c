@@ -1408,6 +1408,24 @@ static NTSTATUS authsam_want_check(struct auth_method_context *ctx,
 		return NT_STATUS_NOT_IMPLEMENTED;
 	}
 
+	{
+		const struct dom_sid *our_sid =
+			samdb_domain_sid(ctx->auth_ctx->sam_ctx);
+
+		if (our_sid != NULL && tdo->sid != NULL &&
+		    !dom_sid_equal(our_sid, tdo->sid))
+		{
+			/*
+			 * Another domain of our forest: winbindd
+			 * passes it through to that domain.
+			 */
+			DBG_DEBUG("%s is in another domain of our forest "
+				  "(DC)\n", effective_domain);
+			TALLOC_FREE(trt);
+			return NT_STATUS_NOT_IMPLEMENTED;
+		}
+	}
+
 	/*
 	 * This principal is within our forest.
 	 * we'll later do a crack_name_to_nt4_name()
