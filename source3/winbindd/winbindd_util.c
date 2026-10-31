@@ -1233,14 +1233,13 @@ static bool add_trusted_domains_dc(void)
 		}
 		if (domains[i]->trust_attributes & LSA_TRUST_ATTRIBUTE_WITHIN_FOREST) {
 			/*
-			 * We don't support WITHIN_FOREST yet.
+			 * A parent or child domain of our forest
+			 * (EXPERIMENTAL multi-domain support): reached
+			 * like the other uplevel trusts, through its
+			 * trust account, with the transitive
+			 * (in forest) logon levels.
 			 */
-			DBG_WARNING("Ignoring WITHIN_FOREST trust to "
-				    "domain[%s/%s]\n",
-				    domains[i]->netbios_name,
-				    domains[i]->domain_name);
-			/* trust_flags |= NETR_TRUST_FLAG_IN_FOREST; */
-			continue;
+			trust_flags |= NETR_TRUST_FLAG_IN_FOREST;
 		}
 
 		if (domains[i]->trust_attributes & LSA_TRUST_ATTRIBUTE_CROSS_ORGANIZATION) {
@@ -1309,7 +1308,6 @@ static bool add_trusted_domains_dc(void)
 
 		if (domains[i]->trust_attributes &
 		    (LSA_TRUST_ATTRIBUTE_PIM_TRUST |
-		     LSA_TRUST_ATTRIBUTE_WITHIN_FOREST |
 		     LSA_TRUST_ATTRIBUTE_CROSS_ORGANIZATION))
 		{
 			/*
@@ -1727,24 +1725,33 @@ struct winbindd_domain *find_routing_from_namespace_noinit(const char *namespace
 {
 	struct winbindd_domain *domain;
 
+	/*
+	 * The exact names of the domains win, before the top level
+	 * names of the forest information: on a DC the forest
+	 * information of our own domain lists the top level names of
+	 * the whole forest, so the names of the other domains of our
+	 * forest would be routed to our own domain.
+	 */
+	for (domain = domain_list(); domain != NULL; domain = domain->next) {
+		if (strequal(namespace, domain->name)) {
+			break;
+		}
+		if (domain->alt_name != NULL &&
+		    strequal(namespace, domain->alt_name)) {
+			break;
+		}
+	}
+	if (domain != NULL) {
+		if (domain->routing_domain != NULL) {
+			return domain->routing_domain;
+		}
+		return domain;
+	}
+
 	/* Search through list */
 
 	for (domain = domain_list(); domain != NULL; domain = domain->next) {
 		bool match;
-
-		match = strequal(namespace, domain->name);
-		if (match) {
-			break;
-		}
-
-		if (domain->alt_name == NULL) {
-			continue;
-		}
-
-		match = strequal(namespace, domain->alt_name);
-		if (match) {
-			break;
-		}
 
 		if (domain->fti == NULL) {
 			continue;

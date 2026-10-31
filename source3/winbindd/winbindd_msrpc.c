@@ -911,8 +911,6 @@ static enum lsa_LookupNamesLevel winbindd_lookup_level(
 	} else if (domain->secure_channel_type == SEC_CHAN_DNS_DOMAIN) {
 		if (domain->domain_flags & NETR_TRUST_FLAG_IN_FOREST) {
 			/*
-			 * TODO:
-			 *
 			 * Depending on what we want to resolve. We need to use:
 			 * 1. LsapLookupXForestReferral(5)/LSA_LOOKUP_NAMES_FOREST_TRUSTS_ONLY
 			 *    if we want to pass the request into the direction of the forest
@@ -920,13 +918,19 @@ static enum lsa_LookupNamesLevel winbindd_lookup_level(
 			 *    LsapLookupXForestResolve(6)/LSA_LOOKUP_NAMES_UPLEVEL_TRUSTS_ONLY2
 			 *    when passing the request to trusted forests.
 			 * 2. LsapLookupGC(4)/LSA_LOOKUP_NAMES_UPLEVEL_TRUSTS_ONLY
-			 *    if we're not a GC and want to resolve a name within our own forest.
+			 *    if we want to resolve a name within our own forest.
 			 *
-			 * As we don't support more than one domain in our own forest
-			 * and always try to be a GC for now, we just set
-			 * LSA_LOOKUP_NAMES_FOREST_TRUSTS_ONLY.
+			 * A DC routes names and sids of the other domains of
+			 * its forest to the domain that holds them (a direct
+			 * parent-child trust), so it asks with
+			 * LsapLookupGC(4). A member uses
+			 * LSA_LOOKUP_NAMES_FOREST_TRUSTS_ONLY as before.
 			 */
-			level = LSA_LOOKUP_NAMES_FOREST_TRUSTS_ONLY;
+			if (IS_DC) {
+				level = LSA_LOOKUP_NAMES_UPLEVEL_TRUSTS_ONLY;
+			} else {
+				level = LSA_LOOKUP_NAMES_FOREST_TRUSTS_ONLY;
+			}
 		} else if (domain->domain_trust_attribs & LSA_TRUST_ATTRIBUTE_FOREST_TRANSITIVE) {
 			/*
 			 * This is LsapLookupXForestResolve(6)/LSA_LOOKUP_NAMES_UPLEVEL_TRUSTS_ONLY2
