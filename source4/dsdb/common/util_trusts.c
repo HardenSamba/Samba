@@ -428,7 +428,11 @@ NTSTATUS dsdb_trust_xref_tdo_info(TALLOC_CTX *mem_ctx,
 	const char *extra_filter = "(!(|(rootTrust=*)(trustParent=*)))";
 	struct ldb_dn *domain_dn = NULL;
 
-	domain_dn = ldb_get_default_basedn(sam_ctx);
+	/*
+	 * On a DC of a child domain our own domain is not the forest
+	 * root domain.
+	 */
+	domain_dn = ldb_get_root_basedn(sam_ctx);
 	if (domain_dn == NULL) {
 		return NT_STATUS_INTERNAL_ERROR;
 	}
