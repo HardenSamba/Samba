@@ -1160,6 +1160,117 @@ static NTSTATUS add_trust_user(TALLOC_CTX *mem_ctx,
 	return NT_STATUS_OK;
 }
 
+/*
+ * A trust with LSA_TRUST_ATTRIBUTE_WITHIN_FOREST is only valid between
+ * a domain of our forest and its direct parent or child domain:
+ *
+ * - there must be a crossRef of an AD domain (SYSTEM_FLAG_CR_NTDS_DOMAIN)
+ *   with the given dnsRoot and nETBIOSName in our Partitions container,
+ * - its trustParent must be our crossRef, or our trustParent must be
+ *   its crossRef,
+ * - if the crossRef knows the SID of the domain, it must match.
+ */
+static NTSTATUS dcesrv_lsa_check_within_forest_trust(
+	TALLOC_CTX *mem_ctx,
+	struct ldb_context *sam_ldb,
+	const struct lsa_TrustDomainInfoInfoEx *info)
+{
+	TALLOC_CTX *frame = talloc_stackframe();
+	const char * const attrs[] = {
+		"nCName", "nETBIOSName", "trustParent", NULL
+	};
+	struct ldb_dn *partitions_dn = NULL;
+	struct ldb_message *their_xref = NULL;
+	struct ldb_message *our_xref = NULL;
+	struct ldb_dn *their_parent = NULL;
+	struct ldb_dn *our_parent = NULL;
+	struct ldb_dn *nc_dn = NULL;
+	const char *nbt_name = NULL;
+	struct dom_sid sid;
+	NTSTATUS status;
+	int ret;
+
+	partitions_dn = samdb_partitions_dn(sam_ldb, frame);
+	if (partitions_dn == NULL) {
+		TALLOC_FREE(frame);
+		return NT_STATUS_NO_MEMORY;
+	}
+
+	ret = dsdb_search_one(sam_ldb, frame, &their_xref,
+			      partitions_dn, LDB_SCOPE_ONELEVEL, attrs,
+			      DSDB_SEARCH_SHOW_EXTENDED_DN,
+			      "(&(objectClass=crossRef)"
+			      "(systemFlags:%s:=%u)"
+			      "(dnsRoot=%s))",
+			      LDB_OID_COMPARATOR_AND,
+			      SYSTEM_FLAG_CR_NTDS_DOMAIN,
+			      ldb_binary_encode_string(frame,
+						       info->domain_name.string));
+	if (ret != LDB_SUCCESS) {
+		DBG_NOTICE("%s is not a domain of our forest\n",
+			   info->domain_name.string);
+		TALLOC_FREE(frame);
+		return NT_STATUS_INVALID_PARAMETER;
+	}
+
+	nbt_name = ldb_msg_find_attr_as_string(their_xref, "nETBIOSName",
+					       NULL);
+	if (nbt_name == NULL ||
+	    strcasecmp(nbt_name, info->netbios_name.string) != 0) {
+		DBG_NOTICE("NetBIOS name %s doesn't match the crossRef "
+			   "of %s (%s)\n", info->netbios_name.string,
+			   info->domain_name.string,
+			   nbt_name != NULL ? nbt_name : "<none>");
+		TALLOC_FREE(frame);
+		return NT_STATUS_INVALID_PARAMETER;
+	}
+
+	nc_dn = samdb_result_dn(sam_ldb, frame, their_xref, "nCName", NULL);
+	if (nc_dn != NULL) {
+		status = dsdb_get_extended_dn_sid(nc_dn, &sid, "SID");
+		if (NT_STATUS_IS_OK(status) && !dom_sid_equal(&sid, info->sid)) {
+			DBG_NOTICE("SID of %s doesn't match its crossRef\n",
+				   info->domain_name.string);
+			TALLOC_FREE(frame);
+			return NT_STATUS_INVALID_SID;
+		}
+	}
+
+	ret = dsdb_search_one(sam_ldb, frame, &our_xref,
+			      partitions_dn, LDB_SCOPE_ONELEVEL, attrs,
+			      0,
+			      "(&(objectClass=crossRef)(nCName=%s))",
+			      ldb_dn_get_linearized(
+				      ldb_get_default_basedn(sam_ldb)));
+	if (ret != LDB_SUCCESS) {
+		TALLOC_FREE(frame);
+		return NT_STATUS_INTERNAL_DB_CORRUPTION;
+	}
+
+	their_parent = samdb_result_dn(sam_ldb, frame, their_xref,
+				       "trustParent", NULL);
+	our_parent = samdb_result_dn(sam_ldb, frame, our_xref,
+				     "trustParent", NULL);
+
+	if (their_parent != NULL &&
+	    ldb_dn_compare(their_parent, our_xref->dn) == 0) {
+		/* they are our child */
+		TALLOC_FREE(frame);
+		return NT_STATUS_OK;
+	}
+	if (our_parent != NULL &&
+	    ldb_dn_compare(our_parent, their_xref->dn) == 0) {
+		/* they are our parent */
+		TALLOC_FREE(frame);
+		return NT_STATUS_OK;
+	}
+
+	DBG_NOTICE("%s is neither our parent nor our child domain\n",
+		   info->domain_name.string);
+	TALLOC_FREE(frame);
+	return NT_STATUS_NOT_SUPPORTED;
+}
+
 static NTSTATUS dcesrv_lsa_CreateTrustedDomain_precheck(
 	TALLOC_CTX *mem_ctx,
 	struct dcesrv_handle *policy_handle,
@@ -1204,9 +1315,17 @@ static NTSTATUS dcesrv_lsa_CreateTrustedDomain_precheck(
 
 	if (info->trust_attributes & LSA_TRUST_ATTRIBUTE_WITHIN_FOREST) {
 		/*
-		 * We don't allow additional domains in our forest yet.
+		 * Only the parent-child trusts of our own forest
+		 * (EXPERIMENTAL multi-domain support), the domain has
+		 * to be known in our Partitions container.
 		 */
-		return NT_STATUS_NOT_SUPPORTED;
+		NTSTATUS status;
+
+		status = dcesrv_lsa_check_within_forest_trust(
+				mem_ctx, policy_state->sam_ldb, info);
+		if (!NT_STATUS_IS_OK(status)) {
+			return status;
+		}
 	}
 
 	if (info->trust_attributes & LSA_TRUST_ATTRIBUTE_PIM_TRUST) {
