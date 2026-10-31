@@ -201,6 +201,7 @@ static int new_partition_from_dn(struct ldb_context *ldb, struct partition_priva
 				 TALLOC_CTX *mem_ctx, 
 				 struct ldb_dn *dn, const char *filename,
 				 const char *backend_db_store,
+				 bool create,
 				 struct dsdb_partition **partition) {
 	struct dsdb_control_current_partition *ctrl;
 	struct ldb_module *backend_module;
@@ -254,8 +255,25 @@ static int new_partition_from_dn(struct ldb_context *ldb, struct partition_priva
 	ctrl->dn = talloc_steal(ctrl, dn);
 	
 	options = ldb_options_get(ldb);
-	ret = ldb_module_connect_backend(
-	    ldb, (*partition)->backend_url, options, &backend_module);
+	if (create) {
+		/*
+		 * The sam.ldb of a running DC is opened with
+		 * LDB_FLG_DONT_CREATE_DB, but a partition created at
+		 * runtime (e.g. the partial replica of a new domain
+		 * of our forest on a global catalog, see
+		 * dsdb_create_partial_replica_NC()) needs a new
+		 * backend database.
+		 */
+		unsigned int flags = ldb_module_flags(ldb);
+
+		ldb_set_flags(ldb, flags & ~LDB_FLG_DONT_CREATE_DB);
+		ret = ldb_module_connect_backend(
+		    ldb, (*partition)->backend_url, options, &backend_module);
+		ldb_set_flags(ldb, flags);
+	} else {
+		ret = ldb_module_connect_backend(
+		    ldb, (*partition)->backend_url, options, &backend_module);
+	}
 	if (ret != LDB_SUCCESS) {
 		return ret;
 	}
@@ -512,6 +530,7 @@ int partition_reload_if_required(struct ldb_module *module,
 		 * schema isn't loaded yet */
 		ret = new_partition_from_dn(ldb, data, data->partitions, dn, 
 					    filename, data->backend_db_store,
+					    false,
 					    &partition);
 		if (ret != LDB_SUCCESS) {
 			talloc_free(mem_ctx);
@@ -818,6 +837,7 @@ int partition_create(struct ldb_module *module, struct ldb_request *req)
 		/* Make a partition structure for this new partition, so we can copy in the template structure */ 
 		ret = new_partition_from_dn(ldb, data, req, ldb_dn_copy(req, dn),
 					    filename, data->backend_db_store,
+					    true,
 					    &partition);
 		if (ret != LDB_SUCCESS) {
 			return ret;
