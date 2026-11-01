@@ -241,6 +241,33 @@ def dns_addr_array_string(array):
     return ret
 
 
+def dns_addr_array(addresses):
+    """A DNS_ADDR_ARRAY of IPv4 and IPv6 addresses (port 53)"""
+    array = dnsserver.DNS_ADDR_ARRAY()
+    addrs = []
+    for address in addresses:
+        sa = [0] * 32
+        try:
+            raw = inet_pton(AF_INET, address)
+            sa[0] = 0x02
+            sa[4:8] = list(raw)
+        except OSError:
+            try:
+                raw = inet_pton(AF_INET6, address)
+            except OSError:
+                raise CommandError('Invalid IP address %s' % address)
+            sa[0] = 0x17
+            sa[8:24] = list(raw)
+        sa[3] = 53
+        a = dnsserver.DNS_ADDR()
+        a.MaxSa = sa
+        addrs.append(a)
+    array.MaxCount = len(addrs)
+    array.AddrCount = len(addrs)
+    array.AddrArray = addrs
+    return array
+
+
 def dns_type_flag(rec_type):
     try:
         return flag_from_string(rec_type)
@@ -850,13 +877,22 @@ class cmd_zonelist(Command):
         Option('--ds', help='List directory integrated zones',
                action='store_true', dest='ds'),
         Option('--non-ds', help='List non-directory zones',
-               action='store_true', dest='nonds')
+               action='store_true', dest='nonds'),
+        Option('--forwarder', help='List conditional forwarders',
+               action='store_true', dest='forwarder'),
+        Option('--stub', help='List stub zones',
+               action='store_true', dest='stub')
     ]
 
     def run(self, server, cli_ver, primary=False, secondary=False, cache=False,
             auto=False, forward=False, reverse=False, ds=False, nonds=False,
+            forwarder=False, stub=False,
             sambaopts=None, credopts=None, versionopts=None):
         request_filter = 0
+        if forwarder:
+            request_filter |= dnsserver.DNS_ZONE_REQUEST_FORWARDER
+        if stub:
+            request_filter |= dnsserver.DNS_ZONE_REQUEST_STUB
 
         if primary:
             request_filter |= dnsserver.DNS_ZONE_REQUEST_PRIMARY
@@ -917,11 +953,33 @@ class cmd_zonecreate(Command):
         Option('--dns-directory-partition',
                help='Specify the naming context for the new zone, which '
                     'affects the replication scope (domain or forest wide '
-                    'replication, default: domain).',
-               default='domain',
-               metavar='domain|forest',
-               choices=['domain', 'forest'],
+                    'replication, or the legacy CN=MicrosoftDNS,CN=System '
+                    'container of the domain; default: '
+                    '"harden:dns default zone partition" of smb.conf, '
+                    'else domain).',
+               default=None,
+               metavar='domain|forest|legacy',
+               choices=['domain', 'forest', 'legacy'],
                dest='dns_dp'),
+        Option('--type', help='Type of the zone (default: primary). '
+               'Conditional forwarders and stub zones need the '
+               '"harden:dns conditional forwarders" and "harden:dns stub '
+               'zones" options on a Samba DNS server.',
+               default='primary', metavar='primary|forwarder|stub',
+               choices=['primary', 'forwarder', 'stub'], dest='zone_type'),
+        Option('--master', help='Master server of a conditional forwarder '
+               'or a stub zone (IP address, can be given several times)',
+               action='append', default=[], dest='masters'),
+        Option('--forwarder-timeout', help='Seconds before a query to a '
+               'master of a conditional forwarder times out (default: 5)',
+               type=int, default=5, dest='forwarder_timeout'),
+        Option('--no-recursion', help='Conditional forwarder: do not use '
+               'the forwarders of the server when the masters do not '
+               'answer', action='store_true', default=False,
+               dest='no_recursion'),
+        Option('--not-ds-integrated', help='Conditional forwarder or stub '
+               'zone stored on this DNS server only, not in the directory',
+               action='store_true', default=False, dest='not_ds'),
     ]
 
     def run(self,
@@ -929,6 +987,11 @@ class cmd_zonecreate(Command):
             zone,
             cli_ver,
             dns_dp,
+            zone_type='primary',
+            masters=None,
+            forwarder_timeout=5,
+            no_recursion=False,
+            not_ds=False,
             sambaopts=None,
             credopts=None,
             versionopts=None):
@@ -937,10 +1000,29 @@ class cmd_zonecreate(Command):
         dns_conn = DnsConnWrapper(server, self.lp, self.creds)
 
         zone = zone.lower()
+        masters = masters or []
+
+        if dns_dp is None:
+            dns_dp = (self.lp.get('harden:dns default zone partition') or
+                      'domain').lower()
+            if dns_dp == 'system':
+                dns_dp = 'legacy'
 
         dns_directorypartition = dnsserver.DNS_DP_DOMAIN_DEFAULT
         if dns_dp == 'forest':
             dns_directorypartition = dnsserver.DNS_DP_FOREST_DEFAULT
+        elif dns_dp == 'legacy':
+            dns_directorypartition = dnsserver.DNS_DP_LEGACY
+
+        dns_zone_type = {'primary': dnsp.DNS_ZONE_TYPE_PRIMARY,
+                         'forwarder': dnsp.DNS_ZONE_TYPE_FORWARDER,
+                         'stub': dnsp.DNS_ZONE_TYPE_STUB}[zone_type]
+        if zone_type != 'primary' and not masters:
+            raise CommandError('A %s zone needs at least one --master' %
+                               zone_type)
+        ds_integrated = 0 if not_ds else 1
+        if not_ds:
+            dns_directorypartition = 0
 
         client_version = dns_client_version(cli_ver)
         if client_version == dnsserver.DNS_CLIENT_VERSION_W2K:
@@ -970,9 +1052,28 @@ class cmd_zonecreate(Command):
             zone_create_info.fLoadExisting = 1
             zone_create_info.dwDpFlags = dns_directorypartition
 
+        if zone_type != 'primary':
+            if client_version != dnsserver.DNS_CLIENT_VERSION_LONGHORN:
+                raise CommandError('Conditional forwarders and stub zones '
+                                   'need --client-version=longhorn')
+            zone_create_info.dwZoneType = dns_zone_type
+            zone_create_info.fLoadExisting = 0
+            zone_create_info.fAllowUpdate = dnsp.DNS_ZONE_UPDATE_OFF
+            zone_create_info.fDsIntegrated = ds_integrated
+            zone_create_info.dwDpFlags = dns_directorypartition
+            zone_create_info.aipMasters = dns_addr_array(masters)
+            if zone_type == 'forwarder':
+                zone_create_info.dwTimeout = forwarder_timeout
+                zone_create_info.fRecurseAfterForwarding = (
+                    1 if no_recursion else 0)
+
         dns_conn.DnssrvOperation2(client_version, 0, server, None,
                                   0, 'ZoneCreate', typeid,
                                   zone_create_info)
+
+        if zone_type != 'primary':
+            self.outf.write('Zone %s created successfully\n' % zone)
+            return
 
         typeid = dnsserver.DNSSRV_TYPEID_NAME_AND_PARAM
         name_and_param = dnsserver.DNS_RPC_NAME_AND_PARAM()
