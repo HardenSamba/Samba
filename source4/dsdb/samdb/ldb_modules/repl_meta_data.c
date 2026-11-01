@@ -5047,7 +5047,16 @@ static int replmd_delete_internals(struct ldb_module *module, struct ldb_request
 				talloc_free(tmp_ctx);
 				return ldb_module_operr(module);
 			}
-			p_el->flags = LDB_FLAG_MOD_ADD;
+			if (dsdb_harden_recycle_bin(ldb)) {
+				/*
+				 * A restored object still has the
+				 * msDS-LastKnownRDN of its previous
+				 * deletion
+				 */
+				p_el->flags = LDB_FLAG_MOD_REPLACE;
+			} else {
+				p_el->flags = LDB_FLAG_MOD_ADD;
+			}
 		}
 	}
 

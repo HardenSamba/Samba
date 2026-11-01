@@ -323,9 +323,42 @@ NTSTATUS dsdb_garbage_collect_tombstones(TALLOC_CTX *mem_ctx,
 	attrs[i] = "isDeleted";
 	attrs[i+1] = NULL;
 
-	filter = talloc_asprintf_append(filter,
-					"(&(isDeleted=TRUE)(whenChanged<=%s)))",
-					expunge_time_string);
+	if (dsdb_harden_recycle_bin(samdb)) {
+		/*
+		 * [MS-ADTS] 3.1.1.1.5.1: the deleted-objects (Recycle
+		 * Bin enabled, no isRecycled) are recycled after the
+		 * deleted-object lifetime; the tombstones and the
+		 * recycled objects are removed after the tombstone
+		 * lifetime.
+		 */
+		uint32_t deleted_lifetime = tombstoneLifetime;
+		unsigned long long recycle_time;
+		char *recycle_time_string = NULL;
+		int ret;
+
+		ret = dsdb_deleted_object_lifetime(samdb, tombstoneLifetime,
+						   &deleted_lifetime);
+		if (ret != LDB_SUCCESS) {
+			return NT_STATUS_INTERNAL_ERROR;
+		}
+		recycle_time = current_time - deleted_lifetime*60*60*24;
+		recycle_time_string = ldb_timestring_utc(mem_ctx,
+							 recycle_time);
+		if (recycle_time_string == NULL) {
+			return NT_STATUS_NO_MEMORY;
+		}
+		filter = talloc_asprintf_append(filter,
+						"(&(isDeleted=TRUE)(isRecycled=TRUE)"
+						"(whenChanged<=%s))"
+						"(&(isDeleted=TRUE)(!(isRecycled=*))"
+						"(whenChanged<=%s)))",
+						expunge_time_string,
+						recycle_time_string);
+	} else {
+		filter = talloc_asprintf_append(filter,
+						"(&(isDeleted=TRUE)(whenChanged<=%s)))",
+						expunge_time_string);
+	}
 	if (filter == NULL) {
 		return NT_STATUS_NO_MEMORY;
 	}

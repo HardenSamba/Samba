@@ -70,6 +70,14 @@ struct tr_context {
 	struct ldb_request *rename_req;
 
 	const struct dsdb_schema *schema;
+
+	/*
+	 * "harden:recycle bin = yes" and the Recycle Bin is enabled: the
+	 * object is a deleted-object (not a tombstone), it still has all
+	 * its attributes, they are kept as they are ([MS-ADTS]
+	 * 3.1.1.5.3.7.2)
+	 */
+	bool deleted_object;
 };
 
 static struct tr_context *tr_init_context(struct ldb_module *module,
@@ -193,6 +201,77 @@ static int tr_do_down_req(struct tr_context *ac, struct ldb_request *down_req)
 	return ret;
 }
 
+/*
+ * Restore of a deleted-object (Recycle Bin enabled): its attributes
+ * were kept, only sAMAccountType and objectCategory were removed by
+ * the deletion. They are computed again, the other attributes are left
+ * as they are (no default values, the primaryGroupID, adminCount... of
+ * the object are kept).
+ */
+static int tr_prepare_deleted_object_attributes(struct tr_context *ac)
+{
+	struct ldb_context *ldb = ldb_module_get_ctx(ac->module);
+	struct ldb_dn *objectcategory = NULL;
+	int ret;
+
+	if (ldb_msg_find_element(ac->search_msg, "sAMAccountType") == NULL) {
+		if (samdb_find_attribute(ldb, ac->search_msg,
+					 "objectclass", "user") != NULL) {
+			uint32_t uac = ldb_msg_find_attr_as_uint(
+				ac->search_msg, "userAccountControl",
+				(uint32_t)-1);
+
+			if (uac == (uint32_t)-1) {
+				return ldb_error(ldb, LDB_ERR_OPERATIONS_ERROR,
+						 "reanimate: No 'userAccountControl' attribute found!");
+			}
+			ret = dsdb_user_obj_set_account_type(ldb, ac->mod_msg,
+							     uac, NULL);
+			if (ret != LDB_SUCCESS) {
+				return ret;
+			}
+		} else if (samdb_find_attribute(ldb, ac->search_msg,
+						"objectclass", "group") != NULL) {
+			uint32_t group_type = ldb_msg_find_attr_as_uint(
+				ac->search_msg, "groupType", 0);
+			uint32_t account_type = ds_gtype2atype(group_type);
+
+			if (account_type == 0) {
+				return ldb_error(ldb, LDB_ERR_UNWILLING_TO_PERFORM,
+						 "reanimate: Unrecognized account type!");
+			}
+			ret = samdb_msg_append_uint(ldb, ac->mod_msg,
+						    ac->mod_msg,
+						    "sAMAccountType",
+						    account_type,
+						    LDB_FLAG_MOD_REPLACE);
+			if (ret != LDB_SUCCESS) {
+				return ret;
+			}
+		}
+	}
+
+	objectcategory = ldb_msg_find_attr_as_dn(ldb, ac, ac->search_msg,
+						 "objectCategory");
+	if (objectcategory == NULL) {
+		const char *value = NULL;
+
+		ret = dsdb_make_object_category(ldb, ac->schema, ac->search_msg,
+						ac->mod_msg, &value);
+		if (ret != LDB_SUCCESS) {
+			return ret;
+		}
+
+		ret = ldb_msg_append_string(ac->mod_msg, "objectCategory", value,
+					    LDB_FLAG_MOD_ADD);
+		if (ret != LDB_SUCCESS) {
+			return ret;
+		}
+	}
+
+	return LDB_SUCCESS;
+}
+
 static int tr_prepare_attributes(struct tr_context *ac)
 {
 	struct ldb_context *ldb = ldb_module_get_ctx(ac->module);
@@ -225,12 +304,22 @@ static int tr_prepare_attributes(struct tr_context *ac)
 	/* - remove distinguishedName - we don't need it */
 	ldb_msg_remove_attr(ac->mod_msg, "distinguishedName");
 
-	/* remove isRecycled */
-	ret = ldb_msg_add_empty(ac->mod_msg, "isRecycled",
-				LDB_FLAG_MOD_DELETE, NULL);
-	if (ret != LDB_SUCCESS) {
-		ldb_asprintf_errstring(ldb, "Failed to reset isRecycled attribute: %s", ldb_strerror(ret));
-		return LDB_ERR_OPERATIONS_ERROR;
+	/*
+	 * remove isRecycled (with "harden:recycle bin", only if it is
+	 * there: a deleted-object has none)
+	 */
+	if (!dsdb_harden_recycle_bin(ldb) ||
+	    ldb_msg_find_element(ac->search_msg, "isRecycled") != NULL) {
+		ret = ldb_msg_add_empty(ac->mod_msg, "isRecycled",
+					LDB_FLAG_MOD_DELETE, NULL);
+		if (ret != LDB_SUCCESS) {
+			ldb_asprintf_errstring(ldb, "Failed to reset isRecycled attribute: %s", ldb_strerror(ret));
+			return LDB_ERR_OPERATIONS_ERROR;
+		}
+	}
+
+	if (ac->deleted_object) {
+		return tr_prepare_deleted_object_attributes(ac);
 	}
 
 	/* objectClass is USER */
@@ -333,6 +422,44 @@ static int tr_prepare_attributes(struct tr_context *ac)
 	return LDB_SUCCESS;
 }
 
+/*
+ * The new parent of the restored object must exist and not be deleted:
+ * ERROR_DS_NO_PARENT_OBJECT otherwise, which the Active Directory
+ * Administrative Center explains to the user.
+ */
+static int tr_check_new_parent(struct tr_context *ac,
+			       const struct ldb_message_element *el_dn)
+{
+	struct ldb_context *ldb = ldb_module_get_ctx(ac->module);
+	struct ldb_dn *new_dn = NULL;
+	struct ldb_dn *parent_dn = NULL;
+	struct ldb_result *res = NULL;
+	static const char * const attrs[] = { NULL };
+	int ret;
+
+	new_dn = ldb_dn_from_ldb_val(ac, ldb, &el_dn->values[0]);
+	if (new_dn == NULL || !ldb_dn_validate(new_dn)) {
+		return ldb_error(ldb, LDB_ERR_INVALID_DN_SYNTAX,
+				 "reanimate: invalid distinguishedName");
+	}
+	parent_dn = ldb_dn_get_parent(ac, new_dn);
+	if (parent_dn == NULL) {
+		return ldb_module_oom(ac->module);
+	}
+
+	ret = dsdb_module_search_dn(ac->module, ac, &res, parent_dn, attrs,
+				    DSDB_FLAG_NEXT_MODULE, ac->req);
+	if (ret == LDB_ERR_NO_SUCH_OBJECT) {
+		return dsdb_module_werror(ac->module,
+					  LDB_ERR_NO_SUCH_OBJECT,
+					  WERR_DS_NO_PARENT_OBJECT,
+					  "reanimate: the parent of the "
+					  "restored object doesn't exist "
+					  "(or is deleted)");
+	}
+	return ret;
+}
+
 /**
  * Handle special LDAP modify request to restore deleted objects
  */
@@ -364,7 +491,9 @@ static int tombstone_reanimate_modify(struct ldb_module *module, struct ldb_requ
 	ret = dsdb_module_search_dn(module, ac, &ac->search_res,
 				    ac->req_msg->dn, NULL,
 				    DSDB_FLAG_TOP_MODULE |
-				    DSDB_SEARCH_SHOW_DELETED,
+				    DSDB_SEARCH_SHOW_DELETED |
+				    (dsdb_harden_recycle_bin(ldb) ?
+				     DSDB_SEARCH_SHOW_RECYCLED : 0),
 				    req);
 	if (ret != LDB_SUCCESS) {
 		return ldb_operr(ldb);
@@ -374,6 +503,34 @@ static int tombstone_reanimate_modify(struct ldb_module *module, struct ldb_requ
 	/* check if it a Deleted Object */
 	if (!ldb_msg_find_attr_as_bool(ac->search_msg, "isDeleted", false)) {
 		return ldb_error(ldb, LDB_ERR_UNWILLING_TO_PERFORM, "Trying to restore not deleted object\n");
+	}
+
+	if (dsdb_harden_recycle_bin(ldb)) {
+		bool enabled = false;
+
+		ret = dsdb_recyclebin_enabled(module, &enabled);
+		if (ret != LDB_SUCCESS) {
+			return ret;
+		}
+		if (enabled &&
+		    ldb_msg_find_attr_as_bool(ac->search_msg, "isRecycled",
+					      false)) {
+			/*
+			 * [MS-ADTS] 3.1.1.5.3.2: a recycled object
+			 * can't be modified, nor restored
+			 */
+			return dsdb_module_werror(module,
+						  LDB_ERR_UNWILLING_TO_PERFORM,
+						  WERR_DS_ILLEGAL_MOD_OPERATION,
+						  "reanimate: a recycled object "
+						  "can't be restored");
+		}
+		ac->deleted_object = enabled;
+
+		ret = tr_check_new_parent(ac, el_dn);
+		if (ret != LDB_SUCCESS) {
+			return ret;
+		}
 	}
 
 	/* Simple implementation */

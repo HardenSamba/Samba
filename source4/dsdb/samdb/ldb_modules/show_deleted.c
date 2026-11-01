@@ -91,6 +91,16 @@ static int show_deleted_search(struct ldb_module *module, struct ldb_request *re
 	} else {
 		state = talloc_get_type(ldb_module_get_private(module), struct show_deleted_state);
 
+		/*
+		 * With "harden:recycle bin = yes", the state of the Recycle
+		 * Bin is checked for every request: it can be enabled in
+		 * the forest while this ldb context is open (the LDAP
+		 * server and other long running processes).
+		 */
+		if (state != NULL && dsdb_harden_recycle_bin(ldb)) {
+			state->need_refresh = true;
+		}
+
 		/* Note that state may be NULL during initialisation */
 		if (state != NULL && state->need_refresh) {
 			/* Do not move this assignment, it can cause recursion loops! */

@@ -1262,6 +1262,7 @@ static int objectclass_delete(struct ldb_module *module, struct ldb_request *req
 	static const char * const attrs[] = { "nCName", "objectClass",
 					      "systemFlags",
 					      "isDeleted",
+					      "isRecycled",
 					      "isCriticalSystemObject", NULL };
 	struct ldb_context *ldb;
 	struct ldb_request *search_req;
@@ -1365,9 +1366,37 @@ static int objectclass_do_delete(struct oc_context *ac)
 	if (ldb_msg_check_string_attribute(ac->search_res->message, "isDeleted", "TRUE") &&
 			(ldb_req_is_untrusted(ac->req) ||
 				!dsdb_module_am_system(ac->module))) {
-		ldb_asprintf_errstring(ldb, "Delete of '%s' failed",
-						ldb_dn_get_linearized(ac->req->op.del.dn));
-		return LDB_ERR_UNWILLING_TO_PERFORM;
+		bool recycle = false;
+
+		if (dsdb_harden_recycle_bin(ldb) &&
+		    !ldb_msg_check_string_attribute(ac->search_res->message,
+						    "isRecycled", "TRUE")) {
+			/*
+			 * With the Recycle Bin enabled, deleting a
+			 * deleted object recycles it, as on Windows
+			 * ([MS-ADTS] 3.1.1.5.5.1.3)
+			 */
+			bool enabled = false;
+
+			ret = dsdb_recyclebin_enabled(ac->module, &enabled);
+			if (ret == LDB_SUCCESS && enabled) {
+				recycle = true;
+			}
+		}
+
+		if (!recycle && dsdb_harden_recycle_bin(ldb)) {
+			return dsdb_module_werror(ac->module,
+						  LDB_ERR_UNWILLING_TO_PERFORM,
+						  WERR_DS_CANT_DELETE,
+						  "objectclass: Cannot delete a "
+						  "tombstone or a recycled "
+						  "object");
+		}
+		if (!recycle) {
+			ldb_asprintf_errstring(ldb, "Delete of '%s' failed",
+					       ldb_dn_get_linearized(ac->req->op.del.dn));
+			return LDB_ERR_UNWILLING_TO_PERFORM;
+		}
 	}
 
 	/* crossRef objects regarding config, schema and default domain NCs */

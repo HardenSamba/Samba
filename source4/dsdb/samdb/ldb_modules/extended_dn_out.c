@@ -49,6 +49,8 @@ struct extended_dn_out_private {
 	bool dereference;
 	bool normalise;
 	const char **attrs;
+	/* "harden:recycle bin = yes": hide the deactivated links */
+	bool hide_deactivated_links;
 };
 
 static char **copy_attrs(void *mem_ctx, const char * const * attrs)
@@ -149,7 +151,32 @@ struct extended_search_context {
 	bool nc_list_loaded;
 	struct ldb_message_element *local_ncs;
 	struct ldb_result *forest_ncs;
+	/*
+	 * Hide the links to and from deleted objects (deactivated
+	 * links, [MS-ADTS] 3.1.1.1.6), unless the request has
+	 * LDB_CONTROL_SHOW_DEACTIVATED_LINK_OID
+	 */
+	bool hide_deactivated_links;
 };
+
+/*
+ * Is dn the DN of a deleted object (its RDN is mangled with "\nDEL:")?
+ */
+static bool dn_is_deleted_object(struct ldb_dn *dn)
+{
+	const struct ldb_val *v = ldb_dn_get_rdn_val(dn);
+	size_t i;
+
+	if (v == NULL || v->length < 5) {
+		return false;
+	}
+	for (i = 0; i + 5 <= v->length; i++) {
+		if (memcmp(v->data + i, "\nDEL:", 5) == 0) {
+			return true;
+		}
+	}
+	return false;
+}
 
 /*
  * Is dn within one of the naming contexts we hold?
@@ -415,6 +442,26 @@ static int extended_callback(struct ldb_request *req, struct ldb_reply *ares)
 	have_reveal_control =
 		dsdb_request_has_control(req, LDB_CONTROL_REVEAL_INTERNALS);
 
+	if (ac->hide_deactivated_links && !have_reveal_control &&
+	    dn_is_deleted_object(msg->dn)) {
+		/*
+		 * The links stored on a deleted object are deactivated
+		 * (with the Recycle Bin enabled, they are kept for a
+		 * restore)
+		 */
+		for (i = 0; i < msg->num_elements; i++) {
+			const struct dsdb_attribute *a =
+				dsdb_attribute_by_lDAPDisplayName(
+					ac->schema, msg->elements[i].name);
+
+			if (a != NULL && a->linkID != 0) {
+				ldb_msg_remove_element(msg,
+						       &msg->elements[i]);
+				i--;
+			}
+		}
+	}
+
 	/* 
 	 * Shortcut for repl_meta_data.  We asked for the data
 	 * 'as-is', so stop processing here!
@@ -517,6 +564,18 @@ static int extended_callback(struct ldb_request *req, struct ldb_reply *ares)
 				return ldb_module_done(ac->req, NULL, NULL, LDB_ERR_INVALID_DN_SYNTAX);
 			}
 			dn = dsdb_dn->dn;
+
+			if (ac->hide_deactivated_links &&
+			    !have_reveal_control &&
+			    attribute->linkID != 0 &&
+			    dn_is_deleted_object(dn)) {
+				/*
+				 * A link to a deleted object is
+				 * deactivated, we won't keep this one
+				 */
+				talloc_free(dsdb_dn);
+				continue;
+			}
 
 			/* we need to know if this is a link to the
 			   deleted objects container for fixing one way
@@ -662,6 +721,19 @@ static int extended_dn_out_search(struct ldb_module *module, struct ldb_request 
 	ac->inject = false;
 	ac->remove_guid = false;
 	ac->remove_sid = false;
+	if (p != NULL && p->hide_deactivated_links &&
+	    (ldb_req_is_untrusted(req) || !dsdb_module_am_system(module))) {
+		/* what the clients see, not the internal searches */
+		struct ldb_control *show_deactivated =
+			ldb_request_get_control(
+				req, LDB_CONTROL_SHOW_DEACTIVATED_LINK_OID);
+
+		if (show_deactivated != NULL) {
+			show_deactivated->critical = 0;
+		} else {
+			ac->hide_deactivated_links = true;
+		}
+	}
 	
 	const_attrs = req->op.search.attrs;
 
@@ -764,12 +836,25 @@ static int extended_dn_out_ldb_init(struct ldb_module *module)
 
 	p->dereference = false;
 	p->normalise = false;
+	p->attrs = NULL;
+	p->hide_deactivated_links =
+		dsdb_harden_recycle_bin(ldb_module_get_ctx(module));
 
 	ret = ldb_mod_register_control(module, LDB_CONTROL_EXTENDED_DN_OID);
 	if (ret != LDB_SUCCESS) {
 		ldb_debug(ldb_module_get_ctx(module), LDB_DEBUG_ERROR,
 			"extended_dn_out: Unable to register control with rootdse!\n");
 		return ldb_operr(ldb_module_get_ctx(module));
+	}
+
+	if (p->hide_deactivated_links) {
+		ret = ldb_mod_register_control(
+			module, LDB_CONTROL_SHOW_DEACTIVATED_LINK_OID);
+		if (ret != LDB_SUCCESS) {
+			ldb_debug(ldb_module_get_ctx(module), LDB_DEBUG_ERROR,
+				"extended_dn_out: Unable to register control with rootdse!\n");
+			return ldb_operr(ldb_module_get_ctx(module));
+		}
 	}
 
 	return ldb_next_init(module);
