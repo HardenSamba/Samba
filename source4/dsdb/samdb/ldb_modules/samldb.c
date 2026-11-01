@@ -4942,6 +4942,245 @@ static int samldb_check_sensitive_attributes(struct samldb_ctx *ac)
 	return LDB_SUCCESS;
 }
 /* add */
+/*
+ * Domain naming master: the crossRefs of the Partitions container
+ * (domains and application partitions of the forest) are only created
+ * or deleted on the DC that holds the domain naming master role
+ * (fSMORoleOwner of the Partitions container), as on Windows.
+ */
+static int samldb_naming_master_check(struct samldb_ctx *ac)
+{
+	struct ldb_context *ldb = ldb_module_get_ctx(ac->module);
+	const char * const attrs[] = { "fSMORoleOwner", NULL };
+	struct ldb_dn *partitions_dn = NULL;
+	struct ldb_dn *ntds_dn = NULL;
+	struct ldb_dn *owner_dn = NULL;
+	struct ldb_result *res = NULL;
+	int ret;
+
+	partitions_dn = samdb_partitions_dn(ldb, ac);
+	if (partitions_dn == NULL) {
+		return ldb_oom(ldb);
+	}
+	ret = dsdb_module_search_dn(ac->module, ac, &res, partitions_dn,
+				    attrs, DSDB_FLAG_NEXT_MODULE, ac->req);
+	if (ret != LDB_SUCCESS) {
+		return ret;
+	}
+	owner_dn = ldb_msg_find_attr_as_dn(ldb, ac, res->msgs[0],
+					   "fSMORoleOwner");
+	ntds_dn = samdb_ntds_settings_dn(ldb, ac);
+	if (owner_dn == NULL || ntds_dn == NULL ||
+	    ldb_dn_compare(owner_dn, ntds_dn) != 0) {
+		return dsdb_module_werror(ac->module,
+					  LDB_ERR_UNWILLING_TO_PERFORM,
+					  WERR_DS_INCORRECT_ROLE_OWNER,
+					  "a crossRef can only be created or "
+					  "deleted on the domain naming "
+					  "master");
+	}
+	return LDB_SUCCESS;
+}
+
+static bool samldb_skip_naming_master_checks(struct samldb_ctx *ac)
+{
+	if (ldb_request_get_control(ac->req, LDB_CONTROL_PROVISION_OID)) {
+		return true;
+	}
+	if (ldb_request_get_control(ac->req, LDB_CONTROL_RELAX_OID)) {
+		return true;
+	}
+	return false;
+}
+
+/*
+ * A new crossRef: only on the naming master, and with a DNS and a
+ * NetBIOS name used by no other crossRef of the forest. The crossRef
+ * of a domain (created with DsAddEntry by the join of the first DC of
+ * a new child domain) needs both names.
+ */
+static int samldb_crossref_add_check(struct samldb_ctx *ac)
+{
+	struct ldb_context *ldb = ldb_module_get_ctx(ac->module);
+	const char * const attrs[] = { "dnsRoot", "nETBIOSName", NULL };
+	struct ldb_dn *partitions_dn = NULL;
+	struct ldb_result *res = NULL;
+	const char *dns_root = NULL;
+	const char *netbios = NULL;
+	char *filter = NULL;
+	int32_t system_flags;
+	int ret;
+
+	if (samldb_skip_naming_master_checks(ac)) {
+		return LDB_SUCCESS;
+	}
+
+	ret = samldb_naming_master_check(ac);
+	if (ret != LDB_SUCCESS) {
+		return ret;
+	}
+
+	system_flags = ldb_msg_find_attr_as_int(ac->msg, "systemFlags", 0);
+	dns_root = ldb_msg_find_attr_as_string(ac->msg, "dnsRoot", NULL);
+	netbios = ldb_msg_find_attr_as_string(ac->msg, "nETBIOSName", NULL);
+	if ((system_flags & SYSTEM_FLAG_CR_NTDS_DOMAIN) &&
+	    (dns_root == NULL || netbios == NULL)) {
+		return dsdb_module_werror(ac->module,
+					  LDB_ERR_UNWILLING_TO_PERFORM,
+					  WERR_DS_MISSING_REQUIRED_ATT,
+					  "the crossRef of a domain needs "
+					  "dnsRoot and nETBIOSName");
+	}
+
+	filter = talloc_strdup(ac, "(&(objectClass=crossRef)(|");
+	if (filter == NULL) {
+		return ldb_oom(ldb);
+	}
+	if (dns_root != NULL) {
+		filter = talloc_asprintf_append_buffer(filter, "(dnsRoot=%s)",
+				ldb_binary_encode_string(ac, dns_root));
+	}
+	if (filter != NULL && netbios != NULL) {
+		filter = talloc_asprintf_append_buffer(filter,
+				"(nETBIOSName=%s)",
+				ldb_binary_encode_string(ac, netbios));
+	}
+	if (filter == NULL) {
+		return ldb_oom(ldb);
+	}
+	if (dns_root == NULL && netbios == NULL) {
+		return LDB_SUCCESS;
+	}
+	filter = talloc_asprintf_append_buffer(filter, "))");
+	partitions_dn = samdb_partitions_dn(ldb, ac);
+	if (filter == NULL || partitions_dn == NULL) {
+		return ldb_oom(ldb);
+	}
+
+	ret = dsdb_module_search(ac->module, ac, &res, partitions_dn,
+				 LDB_SCOPE_ONELEVEL, attrs,
+				 DSDB_FLAG_NEXT_MODULE, ac->req, "%s", filter);
+	if (ret != LDB_SUCCESS) {
+		return ret;
+	}
+	if (res->count > 0) {
+		return dsdb_module_werror(ac->module,
+					  LDB_ERR_ENTRY_ALREADY_EXISTS,
+					  WERR_DS_CROSS_REF_EXISTS,
+					  "a crossRef already uses this "
+					  "dnsRoot or nETBIOSName");
+	}
+
+	return LDB_SUCCESS;
+}
+
+/*
+ * Removing the crossRef of a domain removes the domain from the
+ * forest: on the naming master, once the domain has no DC left.
+ */
+static int samldb_crossref_delete_check(struct samldb_ctx *ac)
+{
+	struct ldb_context *ldb = ldb_module_get_ctx(ac->module);
+	const char * const attrs[] = { "objectClass", "systemFlags",
+				       "nCName", NULL };
+	const char * const dsa_attrs[] = { "msDS-HasDomainNCs", NULL };
+	struct ldb_result *res = NULL;
+	struct ldb_result *dsas = NULL;
+	struct ldb_dn *nc_dn = NULL;
+	struct GUID nc_guid;
+	int32_t system_flags;
+	unsigned int i, j;
+	NTSTATUS status;
+	int ret;
+
+	if (samldb_skip_naming_master_checks(ac)) {
+		return LDB_SUCCESS;
+	}
+
+	{
+		struct ldb_dn *partitions_dn = samdb_partitions_dn(ldb, ac);
+
+		if (partitions_dn == NULL) {
+			return ldb_oom(ldb);
+		}
+		if (ldb_dn_compare_base(partitions_dn,
+					ac->req->op.del.dn) != 0) {
+			/* not in the Partitions container */
+			return LDB_SUCCESS;
+		}
+	}
+
+	ret = dsdb_module_search_dn(ac->module, ac, &res, ac->req->op.del.dn,
+				    attrs,
+				    DSDB_FLAG_NEXT_MODULE |
+				    DSDB_SEARCH_SHOW_EXTENDED_DN,
+				    ac->req);
+	if (ret == LDB_ERR_NO_SUCH_OBJECT) {
+		return LDB_SUCCESS;
+	}
+	if (ret != LDB_SUCCESS) {
+		return ret;
+	}
+	if (samdb_find_attribute(ldb, res->msgs[0], "objectClass",
+				 "crossRef") == NULL) {
+		return LDB_SUCCESS;
+	}
+	ret = samldb_naming_master_check(ac);
+	if (ret != LDB_SUCCESS) {
+		return ret;
+	}
+
+	system_flags = ldb_msg_find_attr_as_int(res->msgs[0],
+						"systemFlags", 0);
+	if (!(system_flags & SYSTEM_FLAG_CR_NTDS_DOMAIN)) {
+		return LDB_SUCCESS;
+	}
+
+	nc_dn = ldb_msg_find_attr_as_dn(ldb, ac, res->msgs[0], "nCName");
+	if (nc_dn == NULL) {
+		return LDB_SUCCESS;
+	}
+	status = dsdb_get_extended_dn_guid(nc_dn, &nc_guid, "GUID");
+	if (!NT_STATUS_IS_OK(status)) {
+		return LDB_SUCCESS;
+	}
+
+	ret = dsdb_module_search(ac->module, ac, &dsas,
+				 ldb_get_config_basedn(ldb),
+				 LDB_SCOPE_SUBTREE, dsa_attrs,
+				 DSDB_FLAG_NEXT_MODULE |
+				 DSDB_SEARCH_SHOW_EXTENDED_DN,
+				 ac->req, "(objectClass=nTDSDSA)");
+	if (ret != LDB_SUCCESS) {
+		return ret;
+	}
+	for (i = 0; i < dsas->count; i++) {
+		struct ldb_message_element *el = NULL;
+
+		el = ldb_msg_find_element(dsas->msgs[i], "msDS-HasDomainNCs");
+		for (j = 0; el != NULL && j < el->num_values; j++) {
+			struct ldb_dn *dn = NULL;
+			struct GUID guid;
+
+			dn = ldb_dn_from_ldb_val(ac, ldb, &el->values[j]);
+			if (dn == NULL) {
+				continue;
+			}
+			status = dsdb_get_extended_dn_guid(dn, &guid, "GUID");
+			if (NT_STATUS_IS_OK(status) &&
+			    GUID_equal(&guid, &nc_guid)) {
+				return dsdb_module_werror(ac->module,
+					LDB_ERR_UNWILLING_TO_PERFORM,
+					WERR_DS_NC_STILL_HAS_DSAS,
+					"the domain still has domain "
+					"controllers");
+			}
+		}
+	}
+
+	return LDB_SUCCESS;
+}
+
 static int samldb_add(struct ldb_module *module, struct ldb_request *req)
 {
 	struct ldb_context *ldb;
@@ -5109,6 +5348,15 @@ static int samldb_add(struct ldb_module *module, struct ldb_request *req)
 		}
 
 		return samldb_fill_object(ac);
+	}
+
+	if (samdb_find_attribute(ldb, ac->msg,
+				 "objectclass", "crossRef") != NULL) {
+		ret = samldb_crossref_add_check(ac);
+		if (ret != LDB_SUCCESS) {
+			talloc_free(ac);
+			return ret;
+		}
 	}
 
 	if (samdb_find_attribute(ldb, ac->msg,
@@ -5523,6 +5771,11 @@ static int samldb_delete(struct ldb_module *module, struct ldb_request *req)
 	}
 
 	ret = samldb_prim_group_users_check(ac);
+	if (ret != LDB_SUCCESS) {
+		return ret;
+	}
+
+	ret = samldb_crossref_delete_check(ac);
 	if (ret != LDB_SUCCESS) {
 		return ret;
 	}
