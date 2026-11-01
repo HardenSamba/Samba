@@ -409,13 +409,23 @@ static int dns_notify_init(struct ldb_module *module)
 	}
 	DLIST_ADD(data->watched, watched);
 
-	/* Check for DomainDnsZones partition and register hook */
+	/*
+	 * Check for DomainDnsZones partition and register hook.
+	 *
+	 * The DomainDnsZones partition is under the domain DN: in a child
+	 * domain of a multi-domain forest ("harden:multi-domain forest"),
+	 * watch the partition of the domain of the DC, not the one of the
+	 * forest root domain.
+	 */
 	watched = talloc_zero(data, struct dns_notify_watched_dn);
 	if (watched == NULL) {
 		talloc_free(data);
 		return ldb_oom(ldb);
 	}
-	watched->dn = ldb_dn_new_fmt(watched, ldb, "CN=MicrosoftDNS,DC=DomainDnsZones,%s", ldb_dn_get_linearized(forest_dn));
+	watched->dn = ldb_dn_new_fmt(watched, ldb, "CN=MicrosoftDNS,DC=DomainDnsZones,%s",
+				     ldb_dn_get_linearized(
+					     dsdb_multi_domain_forest(ldb) ?
+					     domain_dn : forest_dn));
 	DLIST_ADD(data->watched, watched);
 
 	/* Check for ForestDnsZones partition and register hook */
