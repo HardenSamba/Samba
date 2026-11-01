@@ -6417,6 +6417,7 @@ int dsdb_create_partial_replica_NC(struct ldb_context *ldb,  struct ldb_dn *dn)
 	TALLOC_CTX *tmp_ctx = talloc_new(ldb);
 	struct ldb_message *msg;
 	uint32_t dsdb_flags = DSDB_MODIFY_PARTIAL_REPLICA;
+	uint32_t instance_type;
 	int ret;
 
 	if (tmp_ctx == NULL) {
@@ -6449,10 +6450,26 @@ int dsdb_create_partial_replica_NC(struct ldb_context *ldb,  struct ldb_dn *dn)
 		return ldb_oom(ldb);
 	}
 
-	ret = ldb_msg_add_fmt(msg, "instanceType", "%u",
-			      INSTANCE_TYPE_IS_NC_HEAD|
-			      INSTANCE_TYPE_NC_ABOVE|
-			      INSTANCE_TYPE_UNINSTANT);
+	/*
+	 * INSTANCE_TYPE_NC_ABOVE only if we hold the NC above it: a GC of
+	 * a child domain gets the partial replica of the forest root
+	 * domain, above its own domain NC, with nothing above it.
+	 */
+	{
+		struct ldb_dn *parent_dn = ldb_dn_get_parent(tmp_ctx, dn);
+		struct ldb_dn *above_nc = NULL;
+
+		instance_type = INSTANCE_TYPE_IS_NC_HEAD |
+				INSTANCE_TYPE_UNINSTANT;
+		if (parent_dn != NULL &&
+		    dsdb_find_nc_root(ldb, tmp_ctx, parent_dn,
+				      &above_nc) == LDB_SUCCESS)
+		{
+			instance_type |= INSTANCE_TYPE_NC_ABOVE;
+		}
+	}
+
+	ret = ldb_msg_add_fmt(msg, "instanceType", "%u", instance_type);
 	if (ret != LDB_SUCCESS) {
 		talloc_free(tmp_ctx);
 		return ldb_oom(ldb);
