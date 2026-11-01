@@ -35,6 +35,7 @@ from .dcpromo import cmd_domain_dcpromo
 from .demote import cmd_domain_demote
 from .functional_prep import cmd_domain_functional_prep
 from .info import cmd_domain_info
+from .infrastructure import cmd_domain_infrastructure_update
 from .join import cmd_domain_join
 from .kds import cmd_domain_kds
 from .keytab import cmd_domain_export_keytab
@@ -70,6 +71,7 @@ class cmd_domain(SuperCommand):
         subcommands["samba3upgrade"] = cmd_domain_samba3upgrade()
         subcommands["trust"] = cmd_domain_trust()
         subcommands["tombstones"] = cmd_domain_tombstones()
+        subcommands["infrastructure-update"] = cmd_domain_infrastructure_update()
         subcommands["schemaupgrade"] = cmd_domain_schema_upgrade()
         subcommands["functionalprep"] = cmd_domain_functional_prep()
         subcommands["backup"] = cmd_domain_backup()

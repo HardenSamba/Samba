@@ -2061,6 +2061,40 @@ The <constant>--verbose</constant> includes more, probably useless, information.
 </refsect3>
 
 <refsect3>
+	<title>domain infrastructure-update [options]</title>
+	<para>Update the references to the objects of the other domains of the
+	forest, as the infrastructure master of the domain does periodically
+	(from the KCC). In a multi-domain forest, the objects of a domain can
+	reference objects of the other domains (a user of a child domain in a
+	group of the forest root domain, for example). This command looks the
+	targets of these references up in the global catalog, updates the
+	references whose target was renamed or moved, and removes those whose
+	target was deleted. By default, it only runs on the infrastructure
+	master of the domain.</para>
+	<variablelist>
+	  <varlistentry>
+	    <term>-H URL, --URL=URL</term>
+	    <listitem><para>LDB URL for database or target server</para></listitem>
+	  </varlistentry>
+	  <varlistentry>
+	    <term>--gc=URL</term>
+	    <listitem><para>LDB URL of the global catalog to use (default: this
+	    DC if it is a global catalog, else another global catalog of the
+	    forest)</para></listitem>
+	  </varlistentry>
+	  <varlistentry>
+	    <term>--dry-run</term>
+	    <listitem><para>Only show what would be changed</para></listitem>
+	  </varlistentry>
+	  <varlistentry>
+	    <term>--force</term>
+	    <listitem><para>Run even if the DC is not the infrastructure
+	    master</para></listitem>
+	  </varlistentry>
+	</variablelist>
+</refsect3>
+
+<refsect3>
 	<title>domain join <replaceable>dnsdomain</replaceable> [DC|RODC|MEMBER|SUBDOMAIN] [options]</title>
 	<para>Join a domain as either member or backup domain controller.</para>
 </refsect3>
