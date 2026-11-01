@@ -779,18 +779,18 @@ int dsdb_check_samba_compatible_feature(struct ldb_module *module,
   each DC in the forest. It seems likely that it is the job of the KCC
   to propagate between the two
  */
+static int dsdb_check_optional_feature_on(struct ldb_module *module,
+					  TALLOC_CTX *tmp_ctx,
+					  struct ldb_dn *feature_dn,
+					  struct GUID op_feature_guid,
+					  bool *feature_enabled);
+
 int dsdb_check_optional_feature(struct ldb_module *module, struct GUID op_feature_guid, bool *feature_enabled)
 {
 	TALLOC_CTX *tmp_ctx;
 	struct ldb_context *ldb = ldb_module_get_ctx(module);
-	struct ldb_result *res;
-	struct ldb_dn *search_dn;
-	struct GUID search_guid;
-	static const char * const attrs[] = {"msDS-EnabledFeature", NULL};
-	int ret;
-	unsigned int i;
-	struct ldb_message_element *el;
 	struct ldb_dn *feature_dn;
+	int ret;
 
 	tmp_ctx = talloc_new(ldb);
 
@@ -800,6 +800,60 @@ int dsdb_check_optional_feature(struct ldb_module *module, struct GUID op_featur
 		return ldb_operr(ldb_module_get_ctx(module));
 	}
 
+	ret = dsdb_check_optional_feature_on(module, tmp_ctx, feature_dn,
+					     op_feature_guid,
+					     feature_enabled);
+	talloc_free(tmp_ctx);
+	return ret;
+}
+
+/*
+  check if an optional feature is enabled forest wide, on the
+  CN=Partitions container (replicated to every DC of the forest): with
+  "harden:recycle bin = yes", the Recycle Bin is enabled on a DC as soon
+  as it is enabled in the forest, whichever DC enabled it.
+ */
+int dsdb_check_optional_feature_forest(struct ldb_module *module,
+				       struct GUID op_feature_guid,
+				       bool *feature_enabled)
+{
+	struct ldb_context *ldb = ldb_module_get_ctx(module);
+	TALLOC_CTX *tmp_ctx = talloc_new(ldb);
+	struct ldb_dn *partitions_dn = NULL;
+	int ret;
+
+	if (tmp_ctx == NULL) {
+		return ldb_oom(ldb);
+	}
+
+	partitions_dn = samdb_partitions_dn(ldb, tmp_ctx);
+	if (partitions_dn == NULL) {
+		talloc_free(tmp_ctx);
+		return ldb_operr(ldb);
+	}
+
+	ret = dsdb_check_optional_feature_on(module, tmp_ctx, partitions_dn,
+					     op_feature_guid,
+					     feature_enabled);
+	talloc_free(tmp_ctx);
+	return ret;
+}
+
+static int dsdb_check_optional_feature_on(struct ldb_module *module,
+					  TALLOC_CTX *tmp_ctx,
+					  struct ldb_dn *feature_dn,
+					  struct GUID op_feature_guid,
+					  bool *feature_enabled)
+{
+	struct ldb_context *ldb = ldb_module_get_ctx(module);
+	struct ldb_result *res;
+	struct ldb_dn *search_dn;
+	struct GUID search_guid;
+	static const char * const attrs[] = {"msDS-EnabledFeature", NULL};
+	int ret;
+	unsigned int i;
+	struct ldb_message_element *el;
+
 	*feature_enabled = false;
 
 	ret = dsdb_module_search_dn(module, tmp_ctx, &res, feature_dn, attrs, DSDB_FLAG_NEXT_MODULE, NULL);
@@ -807,7 +861,6 @@ int dsdb_check_optional_feature(struct ldb_module *module, struct GUID op_featur
 		ldb_asprintf_errstring(ldb,
 				"Could not find the feature object - dn: %s\n",
 				ldb_dn_get_linearized(feature_dn));
-		talloc_free(tmp_ctx);
 		return LDB_ERR_NO_SUCH_OBJECT;
 	}
 	if (res->msgs[0]->num_elements > 0) {
@@ -824,7 +877,6 @@ int dsdb_check_optional_feature(struct ldb_module *module, struct GUID op_featur
 				ldb_asprintf_errstring(ldb,
 						"Could no find object dn: %s\n",
 						ldb_dn_get_linearized(search_dn));
-				talloc_free(tmp_ctx);
 				return LDB_ERR_OPERATIONS_ERROR;
 			}
 
@@ -836,7 +888,6 @@ int dsdb_check_optional_feature(struct ldb_module *module, struct GUID op_featur
 			}
 		}
 	}
-	talloc_free(tmp_ctx);
 	return LDB_SUCCESS;
 }
 
@@ -1198,6 +1249,23 @@ int dsdb_recyclebin_enabled(struct ldb_module *module, bool *enabled)
 	if (ret != LDB_SUCCESS) {
 		ldb_asprintf_errstring(ldb, "Could not verify if Recycle Bin is enabled \n");
 		return ret;
+	}
+
+	if (!*enabled && dsdb_harden_recycle_bin(ldb)) {
+		/*
+		 * Enabled in the forest (on CN=Partitions), maybe
+		 * by another DC
+		 */
+		ret = dsdb_check_optional_feature_forest(module,
+							 recyclebin_guid,
+							 enabled);
+		if (ret != LDB_SUCCESS) {
+			*enabled = false;
+			if (ret != LDB_ERR_NO_SUCH_OBJECT) {
+				ldb_asprintf_errstring(ldb, "Could not verify if Recycle Bin is enabled \n");
+				return ret;
+			}
+		}
 	}
 
 	return LDB_SUCCESS;

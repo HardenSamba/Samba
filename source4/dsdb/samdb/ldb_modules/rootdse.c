@@ -1277,6 +1277,75 @@ static int dsdb_find_optional_feature(struct ldb_module *module, struct ldb_cont
 	return LDB_SUCCESS;
 }
 
+/*
+ * When the Recycle Bin is enabled, the existing tombstones become
+ * recycled objects: isRecycled is set on the deleted objects (of the NCs
+ * we hold) that don't have it yet, except the Deleted Objects
+ * containers.
+ */
+static int rootdse_recycle_tombstones(struct ldb_module *module,
+				      struct ldb_context *ldb,
+				      TALLOC_CTX *mem_ctx,
+				      struct ldb_request *parent)
+{
+	static const char * const attrs[] = { "isDeleted", "systemFlags",
+					      NULL };
+	struct ldb_result *res = NULL;
+	unsigned int i;
+	int ret;
+
+	ret = dsdb_module_search(module, mem_ctx, &res, NULL,
+				 LDB_SCOPE_SUBTREE, attrs,
+				 DSDB_FLAG_NEXT_MODULE |
+				 DSDB_FLAG_AS_SYSTEM |
+				 DSDB_SEARCH_SEARCH_ALL_PARTITIONS |
+				 DSDB_SEARCH_SHOW_DELETED |
+				 DSDB_SEARCH_SHOW_RECYCLED,
+				 parent,
+				 "(&(isDeleted=TRUE)(!(isRecycled=*)))");
+	if (ret != LDB_SUCCESS) {
+		return ret;
+	}
+
+	for (i = 0; i < res->count; i++) {
+		struct ldb_message *msg = NULL;
+		int32_t system_flags = ldb_msg_find_attr_as_int(
+			res->msgs[i], "systemFlags", 0);
+
+		if (system_flags & SYSTEM_FLAG_DISALLOW_DELETE) {
+			/* a Deleted Objects container */
+			continue;
+		}
+
+		msg = ldb_msg_new(mem_ctx);
+		if (msg == NULL) {
+			return ldb_module_oom(module);
+		}
+		msg->dn = res->msgs[i]->dn;
+		ret = ldb_msg_add_string_flags(msg, "isRecycled", "TRUE",
+					       LDB_FLAG_MOD_REPLACE);
+		if (ret != LDB_SUCCESS) {
+			return ret;
+		}
+		ret = dsdb_module_modify(module, msg,
+					 DSDB_FLAG_NEXT_MODULE |
+					 DSDB_FLAG_AS_SYSTEM |
+					 DSDB_SEARCH_SHOW_RECYCLED,
+					 parent);
+		if (ret != LDB_SUCCESS) {
+			ldb_asprintf_errstring(ldb,
+					       "rootdse: failed to recycle the "
+					       "tombstone %s: %s",
+					       ldb_dn_get_linearized(msg->dn),
+					       ldb_errstring(ldb));
+			return ret;
+		}
+		TALLOC_FREE(msg);
+	}
+
+	return LDB_SUCCESS;
+}
+
 static int rootdse_enable_recycle_bin(struct ldb_module *module,struct ldb_context *ldb,
 				      TALLOC_CTX *mem_ctx, struct ldb_dn *op_feature_scope_dn,
 				      struct ldb_message *op_feature_msg, struct ldb_request *parent)
@@ -1287,9 +1356,33 @@ static int rootdse_enable_recycle_bin(struct ldb_module *module,struct ldb_conte
 	TALLOC_CTX *tmp_ctx;
 	unsigned int el_count = 0;
 	struct ldb_message *msg;
+	uint32_t dsdb_flags = DSDB_FLAG_NEXT_MODULE;
 
 	ret = ldb_msg_find_attr_as_int(op_feature_msg, "msDS-RequiredForestBehaviorVersion", 0);
-	if (domain_func_level < ret){
+	if (dsdb_harden_recycle_bin(ldb)) {
+		/*
+		 * [MS-ADTS] 3.1.1.9.1: the forest functional level,
+		 * and the scope is the Partitions container
+		 */
+		struct ldb_dn *partitions_dn =
+			samdb_partitions_dn(ldb, mem_ctx);
+
+		if (dsdb_forest_functional_level(ldb) < ret) {
+			ldb_asprintf_errstring(ldb,
+					       "rootdse_enable_recycle_bin: Forest functional level must be at least %d\n",
+					       ret);
+			return LDB_ERR_UNWILLING_TO_PERFORM;
+		}
+		if (partitions_dn == NULL ||
+		    ldb_dn_compare(partitions_dn, op_feature_scope_dn) != 0) {
+			return dsdb_module_werror(module,
+						  LDB_ERR_UNWILLING_TO_PERFORM,
+						  WERR_NOT_SUPPORTED,
+						  "rootdse_enable_recycle_bin: "
+						  "the scope of the Recycle Bin "
+						  "is the Partitions container");
+		}
+	} else if (domain_func_level < ret){
 		ldb_asprintf_errstring(ldb,
 				       "rootdse_enable_recycle_bin: Domain functional level must be at least %d\n",
 				       ret);
@@ -1319,7 +1412,16 @@ static int rootdse_enable_recycle_bin(struct ldb_module *module,struct ldb_conte
 	ldb_msg_add_linearized_dn(msg, "msDS-EnabledFeature", op_feature_msg->dn);
 	msg->elements[el_count++].flags = LDB_FLAG_MOD_ADD;
 
-	ret = dsdb_module_modify(module, msg, DSDB_FLAG_NEXT_MODULE, parent);
+	/*
+	 * msDS-EnabledFeature is system only: with "harden:recycle bin",
+	 * the rights of the caller were checked already
+	 * (Manage-Optional-Features)
+	 */
+	if (dsdb_harden_recycle_bin(ldb)) {
+		dsdb_flags |= DSDB_FLAG_AS_SYSTEM;
+	}
+
+	ret = dsdb_module_modify(module, msg, dsdb_flags, parent);
 	if (ret != LDB_SUCCESS) {
 		ldb_asprintf_errstring(ldb,
 				       "rootdse_enable_recycle_bin: Failed to modify object %s - %s",
@@ -1330,7 +1432,7 @@ static int rootdse_enable_recycle_bin(struct ldb_module *module,struct ldb_conte
 	}
 
 	msg->dn = op_feature_scope_dn;
-	ret = dsdb_module_modify(module, msg, DSDB_FLAG_NEXT_MODULE, parent);
+	ret = dsdb_module_modify(module, msg, dsdb_flags, parent);
 	if (ret != LDB_SUCCESS) {
 		ldb_asprintf_errstring(ldb,
 				       "rootdse_enable_recycle_bin: Failed to modify object %s - %s",
@@ -1338,6 +1440,18 @@ static int rootdse_enable_recycle_bin(struct ldb_module *module,struct ldb_conte
 				       ldb_errstring(ldb));
 		talloc_free(tmp_ctx);
 		return ret;
+	}
+
+	if (dsdb_harden_recycle_bin(ldb)) {
+		/*
+		 * [MS-ADTS] 3.1.1.9.1: all the tombstones become
+		 * recycled objects
+		 */
+		ret = rootdse_recycle_tombstones(module, ldb, tmp_ctx, parent);
+		if (ret != LDB_SUCCESS) {
+			talloc_free(tmp_ctx);
+			return ret;
+		}
 	}
 
 	return LDB_SUCCESS;
@@ -1367,7 +1481,32 @@ static int rootdse_enableoptionalfeature(struct ldb_module *module, struct ldb_r
 	int ret;
 	const char *guid_string;
 
-	if (security_session_user_level(session_info, NULL) != SECURITY_SYSTEM) {
+	if (security_session_user_level(session_info, NULL) != SECURITY_SYSTEM &&
+	    dsdb_harden_recycle_bin(ldb)) {
+		/*
+		 * [MS-ADTS] 3.1.1.3.3.28: the Manage-Optional-Features
+		 * control access right on the scope (the Partitions
+		 * container), which the Enterprise Admins have
+		 */
+		struct ldb_dn *partitions_dn = samdb_partitions_dn(ldb, tmp_ctx);
+		struct GUID right_guid;
+
+		GUID_from_string("7c0e2a7c-a419-48e4-a995-10180aad54dd",
+				 &right_guid);
+		if (partitions_dn == NULL) {
+			talloc_free(tmp_ctx);
+			return ldb_oom(ldb);
+		}
+		ret = dsdb_module_check_access_on_dn(module, tmp_ctx,
+						     partitions_dn,
+						     SEC_ADS_CONTROL_ACCESS,
+						     &right_guid, req);
+		if (ret != LDB_SUCCESS) {
+			ldb_set_errstring(ldb, "rootdse: Insufficient rights for enableoptionalfeature");
+			talloc_free(tmp_ctx);
+			return LDB_ERR_INSUFFICIENT_ACCESS_RIGHTS;
+		}
+	} else if (security_session_user_level(session_info, NULL) != SECURITY_SYSTEM) {
 		ldb_set_errstring(ldb, "rootdse: Insufficient rights for enableoptionalfeature");
 		return LDB_ERR_UNWILLING_TO_PERFORM;
 	}

@@ -1497,6 +1497,26 @@ bool dsdb_multi_domain_forest(struct ldb_context *ldb)
 }
 
 /*
+  Does the DC handle the AD Recycle Bin as Windows does
+  ("harden:recycle bin = yes" in smb.conf)? Off by default.
+
+  The Recycle Bin itself is still an optional feature of the forest:
+  this only changes how a DC behaves once it is enabled (it is seen
+  as enabled when the CN=Partitions container says so, restores keep
+  the attributes of the object, deleted objects can be recycled...).
+*/
+bool dsdb_harden_recycle_bin(struct ldb_context *ldb)
+{
+	struct loadparm_context *lp_ctx = talloc_get_type(
+		ldb_get_opaque(ldb, "loadparm"), struct loadparm_context);
+
+	if (lp_ctx == NULL) {
+		return false;
+	}
+	return lpcfg_parm_bool(lp_ctx, NULL, "harden", "recycle bin", false);
+}
+
+/*
   get the SID of the forest root domain.
 
   In the forest root domain this is our own domain SID. In a child
@@ -5129,6 +5149,45 @@ int dsdb_tombstone_lifetime(struct ldb_context *ldb, uint32_t *lifetime)
 
 	*lifetime = samdb_search_uint(ldb, dn, 180, dn, "tombstoneLifetime", "objectClass=nTDSService");
 	talloc_free(dn);
+	return LDB_SUCCESS;
+}
+
+/*
+  The deleted-object lifetime of the forest, in days: msDS-DeletedObject-
+  Lifetime of the Directory Service object, or the tombstone lifetime when
+  it is not set ([MS-ADTS] 3.1.1.1.5.1), at least 2 days.
+ */
+int dsdb_deleted_object_lifetime(struct ldb_context *ldb,
+				 uint32_t tombstone_lifetime,
+				 uint32_t *lifetime)
+{
+	struct ldb_dn *dn;
+	uint32_t value;
+
+	dn = ldb_get_config_basedn(ldb);
+	if (!dn) {
+		return ldb_error(ldb, LDB_ERR_NO_SUCH_OBJECT, __func__);
+	}
+	dn = ldb_dn_copy(ldb, dn);
+	if (!dn) {
+		return ldb_operr(ldb);
+	}
+	if (!ldb_dn_add_child_fmt(dn, "CN=Directory Service,CN=Windows NT,CN=Services")) {
+		talloc_free(dn);
+		return ldb_operr(ldb);
+	}
+
+	value = samdb_search_uint(ldb, dn, 0, dn,
+				  "msDS-DeletedObjectLifetime",
+				  "objectClass=nTDSService");
+	talloc_free(dn);
+	if (value == 0) {
+		value = tombstone_lifetime;
+	}
+	if (value < 2) {
+		value = 2;
+	}
+	*lifetime = value;
 	return LDB_SUCCESS;
 }
 
