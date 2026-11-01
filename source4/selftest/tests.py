@@ -1514,6 +1514,8 @@ planpythontestsuite("none",
 # EXPERIMENTAL: child domain created with
 # 'samba-tool domain join ... SUBDOMAIN' (multi-domain forest)
 planpythontestsuite("subdom_dc:local", "samba.tests.subdomain")
+planpythontestsuite("subdom_dc:local", "samba.tests.dns_harden")
+planpythontestsuite("subdom_dc:local", "samba.tests.onelevel_order")
 
 planoldpythontestsuite("ad_dc",
                        "samba.tests.krb5_credentials",

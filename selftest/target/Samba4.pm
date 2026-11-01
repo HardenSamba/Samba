@@ -1648,6 +1648,13 @@ sub provision_subdom_dc($$$)
 	max xmit = 32K
 	server max protocol = SMB2
 
+	# the Harden-Box DNS options (samba.tests.dns_harden), and the
+	# order of the one-level searches (samba.tests.onelevel_order)
+	harden:dns conditional forwarders = yes
+	harden:dns stub zones = yes
+	harden:dns default zone partition = forest
+	harden:sort one-level results = yes
+
 [sysvol]
 	path = $ctx->{statedir}/sysvol
 	read only = yes
