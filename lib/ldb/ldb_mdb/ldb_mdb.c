@@ -1120,8 +1120,16 @@ int lmdb_connect(struct ldb_context *ldb,
 	ldb_kv->kv_ops = &lmdb_key_value_ops;
 
 	{
+		/*
+		 * The options of this connection (e.g. those of a
+		 * partition backend) win over the ones of the ldb
+		 */
 		const char *size = ldb_options_find(
-			ldb, ldb->options, "lmdb_env_size");
+			ldb, options, "lmdb_env_size");
+		if (size == NULL) {
+			size = ldb_options_find(
+				ldb, ldb->options, "lmdb_env_size");
+		}
 		if (size != NULL) {
 			env_map_size = strtoull(size, NULL, 0);
 		}
