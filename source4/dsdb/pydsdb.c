@@ -1255,6 +1255,42 @@ static PyObject *py_dsdb_create_own_rid_set(PyObject *self, PyObject *args)
 }
 
 /*
+  create the (uninstantiated) NC head of a partial replica, from the
+  extended DN (with the GUID and SID of the NC) of its crossRef nCName
+ */
+static PyObject *py_dsdb_create_partial_replica_NC(PyObject *self,
+						   PyObject *args)
+{
+	PyObject *py_ldb;
+	struct ldb_context *ldb;
+	const char *dn_str = NULL;
+	struct ldb_dn *dn = NULL;
+	TALLOC_CTX *frame = NULL;
+	int ret;
+
+	if (!PyArg_ParseTuple(args, "Os", &py_ldb, &dn_str)) {
+		return NULL;
+	}
+
+	PyErr_LDB_OR_RAISE(py_ldb, ldb);
+
+	frame = talloc_stackframe();
+	dn = ldb_dn_new(frame, ldb, dn_str);
+	if (dn == NULL || !ldb_dn_validate(dn)) {
+		TALLOC_FREE(frame);
+		PyErr_Format(PyExc_ValueError, "Invalid DN %s", dn_str);
+		return NULL;
+	}
+
+	ret = dsdb_create_partial_replica_NC(ldb, dn);
+	TALLOC_FREE(frame);
+
+	PyErr_LDB_ERROR_IS_ERR_RAISE(py_ldb_get_exception(), ret, ldb);
+
+	Py_RETURN_NONE;
+}
+
+/*
   call DSDB_EXTENDED_ALLOCATE_RID to get a new RID set for this server
  */
 static PyObject *py_dsdb_allocate_rid(PyObject *self, PyObject *args)
@@ -1799,6 +1835,10 @@ static PyMethodDef py_dsdb_methods[] = {
 	  METH_VARARGS | METH_KEYWORDS,
 	  PyDoc_STR("_dsdb_create_gkdi_root_key(samdb)"
 		    " -> Dn of the new root key") },
+	{ "_dsdb_create_partial_replica_NC",
+		(PyCFunction)py_dsdb_create_partial_replica_NC, METH_VARARGS,
+		"_dsdb_create_partial_replica_NC(samdb, dn)\n"
+		"Create the uninstantiated NC head of a partial replica." },
 	{ "_dsdb_create_own_rid_set", (PyCFunction)py_dsdb_create_own_rid_set, METH_VARARGS,
 		"_dsdb_create_own_rid_set(samdb)"
 		" -> None" },
