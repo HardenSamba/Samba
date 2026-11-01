@@ -909,6 +909,32 @@ class DCJoinContext(object):
                            exop=drsuapi.DRSUAPI_EXOP_REPL_OBJ,
                            replica_flags=drsuapi.DRSUAPI_DRS_WRIT_REP)
 
+        if ctx.forestdns_zone in ctx.nc_list:
+            ctx.join_add_forestdns_replica_location()
+
+    def join_add_forestdns_replica_location(ctx):
+        """List our new nTDSDSA object in the msDS-NC-Replica-Locations
+        of the crossRef of the ForestDnsZones partition (on the DC we
+        are joining through), as we hold a replica of it, so that the
+        KCC of the other DCs of the forest replicates it with us."""
+        expr = "(&(objectClass=crossRef)(nCName=%s))" % \
+            ldb.binary_encode(ctx.forestdns_zone)
+        res = ctx.samdb.search(base=ctx.samdb.get_partitions_dn(),
+                               scope=ldb.SCOPE_ONELEVEL,
+                               expression=expr, attrs=[])
+        if len(res) != 1:
+            ctx.logger.warning("No crossRef found for %s" %
+                               ctx.forestdns_zone)
+            return
+
+        print("Adding %s to the replica locations of %s" %
+              (ctx.ntds_dn, ctx.forestdns_zone))
+        m = ldb.Message()
+        m.dn = res[0].dn
+        m["msDS-NC-Replica-Locations"] = ldb.MessageElement(
+            ctx.ntds_dn, ldb.FLAG_MOD_ADD, "msDS-NC-Replica-Locations")
+        ctx.samdb.modify(m)
+
     def join_provision(ctx):
         """Provision the local SAM."""
 
@@ -1671,7 +1697,9 @@ class DCJoinContext(object):
         # crossRef) is created by the local provision of the domain
         # (setup_dns_partitions() with FILL_SUBDOMAIN), after the
         # nTDSDSA object was created on the naming master with
-        # DsAddEntry, so it can't be listed there yet.
+        # DsAddEntry, so it can't be listed there yet. The
+        # ForestDnsZones partition belongs to the whole forest: like
+        # the Configuration and Schema NCs, we replicate it.
         if not ctx.subdomain:
             ctx.nc_list += [ctx.base_dn]
 
@@ -1680,6 +1708,9 @@ class DCJoinContext(object):
                 ctx.nc_list += [ctx.forestdns_zone]
                 ctx.full_nc_list += [ctx.domaindns_zone]
                 ctx.full_nc_list += [ctx.forestdns_zone]
+        elif ctx.dns_backend != "NONE":
+            ctx.nc_list += [ctx.forestdns_zone]
+            ctx.full_nc_list += [ctx.forestdns_zone]
 
     def do_join(ctx):
         ctx.build_nc_lists()
@@ -1826,9 +1857,8 @@ def join_subdomain(logger=None, server=None, creds=None, lp=None, site=None,
     domain NC locally and finally set up the two-way intra-forest
     (parent-child) trust.
 
-    EXPERIMENTAL: multi-domain forests are not supported by the rest
-    of Samba yet (Kerberos referrals, NTLM pass-through, LSA lookups
-    and the global catalog only handle a single domain).
+    EXPERIMENTAL: see the Harden-Box README for what works in a
+    multi-domain forest and what does not yet.
     """
     ctx = DCJoinContext(logger, server, creds, lp, site, netbios_name,
                         targetdir, parent_domain, machinepass, use_ntvfs,
