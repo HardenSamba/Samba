@@ -1231,6 +1231,20 @@ static bool add_trusted_domains_dc(void)
 				    domains[i]->domain_name);
 			continue;
 		}
+		if ((domains[i]->trust_attributes &
+		     LSA_TRUST_ATTRIBUTE_WITHIN_FOREST) &&
+		    !lp_parm_bool(-1, "harden", "multi-domain forest", false))
+		{
+			/*
+			 * We don't support WITHIN_FOREST without
+			 * "harden:multi-domain forest = yes".
+			 */
+			DBG_WARNING("Ignoring WITHIN_FOREST trust to "
+				    "domain[%s/%s]\n",
+				    domains[i]->netbios_name,
+				    domains[i]->domain_name);
+			continue;
+		}
 		if (domains[i]->trust_attributes & LSA_TRUST_ATTRIBUTE_WITHIN_FOREST) {
 			/*
 			 * A parent or child domain of our forest
@@ -1314,6 +1328,13 @@ static bool add_trusted_domains_dc(void)
 			 * These were ignored above, so there's no
 			 * winbindd domain for them.
 			 */
+			continue;
+		}
+		if ((domains[i]->trust_attributes &
+		     LSA_TRUST_ATTRIBUTE_WITHIN_FOREST) &&
+		    !lp_parm_bool(-1, "harden", "multi-domain forest", false))
+		{
+			/* also ignored above */
 			continue;
 		}
 
@@ -1721,9 +1742,60 @@ struct winbindd_domain *find_trust_from_name_noinit(const char *domain_name)
 	return NULL;
 }
 
+static struct winbindd_domain *find_routing_from_namespace_single(
+	const char *namespace)
+{
+	struct winbindd_domain *domain;
+
+	/* Search through list */
+
+	for (domain = domain_list(); domain != NULL; domain = domain->next) {
+		bool match;
+
+		match = strequal(namespace, domain->name);
+		if (match) {
+			break;
+		}
+
+		if (domain->alt_name == NULL) {
+			continue;
+		}
+
+		match = strequal(namespace, domain->alt_name);
+		if (match) {
+			break;
+		}
+
+		if (domain->fti == NULL) {
+			continue;
+		}
+
+		match = trust_forest_info_match_tln_namespace(domain->fti,
+							      namespace);
+		if (match) {
+			break;
+		}
+	}
+
+	if (domain == NULL) {
+		/* Not found */
+		return NULL;
+	}
+
+	if (domain->routing_domain != NULL) {
+		return domain->routing_domain;
+	}
+
+	return domain;
+}
+
 struct winbindd_domain *find_routing_from_namespace_noinit(const char *namespace)
 {
 	struct winbindd_domain *domain;
+
+	if (!lp_parm_bool(-1, "harden", "multi-domain forest", false)) {
+		return find_routing_from_namespace_single(namespace);
+	}
 
 	/*
 	 * The exact names of the domains win, before the top level

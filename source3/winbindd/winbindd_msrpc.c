@@ -926,7 +926,9 @@ static enum lsa_LookupNamesLevel winbindd_lookup_level(
 			 * LsapLookupGC(4). A member uses
 			 * LSA_LOOKUP_NAMES_FOREST_TRUSTS_ONLY as before.
 			 */
-			if (IS_DC) {
+			if (IS_DC &&
+			    lp_parm_bool(-1, "harden",
+					 "multi-domain forest", false)) {
 				level = LSA_LOOKUP_NAMES_UPLEVEL_TRUSTS_ONLY;
 			} else {
 				level = LSA_LOOKUP_NAMES_FOREST_TRUSTS_ONLY;
