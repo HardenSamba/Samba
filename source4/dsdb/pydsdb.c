@@ -34,6 +34,8 @@
 #include "dsdb/kcc/garbage_collect_tombstones.h"
 #include "dsdb/kcc/scavenge_dns_records.h"
 #include "libds/common/flag_mapping.h"
+#include "librpc/gen_ndr/auth.h"
+#include "dsdb/common/proto.h"
 
 #undef strcasecmp
 
@@ -1255,6 +1257,81 @@ static PyObject *py_dsdb_create_own_rid_set(PyObject *self, PyObject *args)
 }
 
 /*
+  apply the SID filtering of an intra-forest trust to a list of SIDs
+  (for the tests): returns the SIDs that pass
+ */
+static PyObject *py_dsdb_trust_filter_within_forest_sids(PyObject *self,
+							 PyObject *args)
+{
+	unsigned int trust_attributes;
+	const char *trusted_sid_str = NULL;
+	PyObject *py_sids = NULL;
+	PyObject *py_ret = NULL;
+	struct dom_sid trusted_sid;
+	struct auth_SidAttr *sids = NULL;
+	uint32_t num_sids;
+	TALLOC_CTX *frame = NULL;
+	NTSTATUS status;
+	Py_ssize_t i;
+
+	if (!PyArg_ParseTuple(args, "IzO!", &trust_attributes,
+			      &trusted_sid_str, &PyList_Type, &py_sids)) {
+		return NULL;
+	}
+
+	frame = talloc_stackframe();
+	if (trusted_sid_str != NULL &&
+	    !dom_sid_parse(trusted_sid_str, &trusted_sid)) {
+		TALLOC_FREE(frame);
+		PyErr_Format(PyExc_ValueError, "Invalid SID %s",
+			     trusted_sid_str);
+		return NULL;
+	}
+
+	num_sids = PyList_Size(py_sids);
+	sids = talloc_zero_array(frame, struct auth_SidAttr, num_sids);
+	if (sids == NULL && num_sids > 0) {
+		TALLOC_FREE(frame);
+		return PyErr_NoMemory();
+	}
+	for (i = 0; i < num_sids; i++) {
+		PyObject *item = PyList_GetItem(py_sids, i);
+		const char *str = PyUnicode_AsUTF8(item);
+
+		if (str == NULL || !dom_sid_parse(str, &sids[i].sid)) {
+			TALLOC_FREE(frame);
+			PyErr_Format(PyExc_ValueError, "Invalid SID at %zd", i);
+			return NULL;
+		}
+	}
+
+	status = dsdb_trust_filter_within_forest_sids(
+		trust_attributes,
+		trusted_sid_str != NULL ? &trusted_sid : NULL,
+		"python", &num_sids, sids);
+	if (!NT_STATUS_IS_OK(status)) {
+		TALLOC_FREE(frame);
+		PyErr_SetNTSTATUS(status);
+		return NULL;
+	}
+
+	py_ret = PyList_New(num_sids);
+	if (py_ret == NULL) {
+		TALLOC_FREE(frame);
+		return NULL;
+	}
+	for (i = 0; i < num_sids; i++) {
+		struct dom_sid_buf buf;
+
+		PyList_SetItem(py_ret, i,
+			       PyUnicode_FromString(
+				       dom_sid_str_buf(&sids[i].sid, &buf)));
+	}
+	TALLOC_FREE(frame);
+	return py_ret;
+}
+
+/*
   create the (uninstantiated) NC head of a partial replica, from the
   extended DN (with the GUID and SID of the NC) of its crossRef nCName
  */
@@ -1835,6 +1912,12 @@ static PyMethodDef py_dsdb_methods[] = {
 	  METH_VARARGS | METH_KEYWORDS,
 	  PyDoc_STR("_dsdb_create_gkdi_root_key(samdb)"
 		    " -> Dn of the new root key") },
+	{ "_dsdb_trust_filter_within_forest_sids",
+		(PyCFunction)py_dsdb_trust_filter_within_forest_sids,
+		METH_VARARGS,
+		"_dsdb_trust_filter_within_forest_sids(trust_attributes, "
+		"trusted_sid, [sids]) -> [sids]\n"
+		"Apply the SID filtering of an intra-forest trust." },
 	{ "_dsdb_create_partial_replica_NC",
 		(PyCFunction)py_dsdb_create_partial_replica_NC, METH_VARARGS,
 		"_dsdb_create_partial_replica_NC(samdb, dn)\n"

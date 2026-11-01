@@ -37,6 +37,7 @@
 #include "lib/crypto/md4.h"
 #include "libcli/ldap/ldap_ndr.h"
 #include "libcli/security/claims_transformation.h"
+#include "librpc/gen_ndr/auth.h"
 
 #undef strcasecmp
 
@@ -3448,5 +3449,163 @@ NTSTATUS dsdb_trust_get_claims_tf_policy(struct ldb_context *samldb,
 
 	*_rule_set = talloc_move(mem_ctx, &rule_set);
 	TALLOC_FREE(frame);
+	return NT_STATUS_OK;
+}
+
+/*
+ * SID filtering of the authorization data that comes from another
+ * domain of our forest, through a WITHIN_FOREST (parent-child) trust,
+ * see [MS-PAC] 4.1.2.2 SID Filtering and Claims Transformation:
+ *
+ * - WithinForest: only the SIDs of the "AlwaysFilter" category
+ *   (well-known, built-in, logon and partially formed SIDs) are removed,
+ *   the domains of a forest trust each other;
+ *
+ * - QuarantinedWithinForest (LSA_TRUST_ATTRIBUTE_QUARANTINED_DOMAIN on
+ *   the trust): only the Enterprise Domain Controllers SID, the SIDs of
+ *   the trusted domain and the "NeverFilter" SIDs may pass.
+ *
+ * The first two SIDs (user and primary group) may not be removed:
+ * NT_STATUS_ACCESS_DENIED is returned if one of them would be.
+ */
+enum dsdb_trust_sid_category {
+	DSDB_TRUST_SID_ALWAYS_FILTER,
+	DSDB_TRUST_SID_NEVER_FILTER,
+	DSDB_TRUST_SID_EDC,
+	DSDB_TRUST_SID_DOMAIN,
+};
+
+static enum dsdb_trust_sid_category dsdb_trust_sid_category(
+						const struct dom_sid *sid)
+{
+	uint64_t authority = 0;
+	uint32_t r;
+	int i;
+
+	if (sid->sid_rev_num != 1) {
+		return DSDB_TRUST_SID_ALWAYS_FILTER;
+	}
+	for (i = 0; i < 6; i++) {
+		authority = (authority << 8) | sid->id_auth[i];
+	}
+
+	switch (authority) {
+	case 0: /* S-1-0 Null */
+	case 1: /* S-1-1 World */
+	case 2: /* S-1-2 Local */
+	case 3: /* S-1-3 Creator */
+	case 6: /* S-1-6 SiteServer */
+	case 7: /* S-1-7 Internet Site */
+	case 8: /* S-1-8 Exchange */
+	case 9: /* S-1-9 Resource Manager */
+		return DSDB_TRUST_SID_ALWAYS_FILTER;
+	case 4: /* S-1-4 NonUnique */
+	case 10: /* S-1-10 Passport */
+		return DSDB_TRUST_SID_NEVER_FILTER;
+	case 5: /* S-1-5 NT Authority, below */
+		break;
+	default:
+		/* e.g. S-1-16 (labels) or S-1-18 (asserted identity) */
+		return DSDB_TRUST_SID_NEVER_FILTER;
+	}
+
+	if (sid->num_auths == 0) {
+		return DSDB_TRUST_SID_ALWAYS_FILTER;
+	}
+	r = sid->sub_auths[0];
+
+	if (r == 9) {
+		/* S-1-5-9 Enterprise Domain Controllers */
+		return DSDB_TRUST_SID_EDC;
+	}
+	if (r == 15) {
+		/* S-1-5-15 This Organization */
+		return DSDB_TRUST_SID_NEVER_FILTER;
+	}
+	if (r == 21) {
+		/*
+		 * S-1-5-21, S-1-5-21-x, S-1-5-21-x-y (partially
+		 * formed), S-1-5-21-X-Y-Z (a domain, not a principal)
+		 * and S-1-5-21-X-Y-Z-R-* (too many RIDs)
+		 */
+		if (sid->num_auths != 5) {
+			return DSDB_TRUST_SID_ALWAYS_FILTER;
+		}
+		if (sid->sub_auths[1] == 0 && sid->sub_auths[2] == 0 &&
+		    sid->sub_auths[3] == 0) {
+			/* S-1-5-21-0-0-0-496/497 compounded auth/claims */
+			return DSDB_TRUST_SID_NEVER_FILTER;
+		}
+		return DSDB_TRUST_SID_DOMAIN;
+	}
+	if (r >= 1000) {
+		/* S-1-5-1000-* other organization, S-1-5-R-* extensible */
+		return DSDB_TRUST_SID_NEVER_FILTER;
+	}
+
+	/* S-1-5-R-*, R < 1000: built-in, logon, well-known... */
+	return DSDB_TRUST_SID_ALWAYS_FILTER;
+}
+
+NTSTATUS dsdb_trust_filter_within_forest_sids(uint32_t trust_attributes,
+					      const struct dom_sid *trusted_sid,
+					      const char *source,
+					      uint32_t *num_sids,
+					      struct auth_SidAttr *sids)
+{
+	bool quarantined = trust_attributes &
+			   LSA_TRUST_ATTRIBUTE_QUARANTINED_DOMAIN;
+	uint32_t i, n;
+
+	if (!(trust_attributes & LSA_TRUST_ATTRIBUTE_WITHIN_FOREST)) {
+		return NT_STATUS_OK;
+	}
+
+	for (i = 0, n = 0; i < *num_sids; i++) {
+		enum dsdb_trust_sid_category c;
+		struct dom_sid_buf buf;
+		bool filter = false;
+
+		c = dsdb_trust_sid_category(&sids[i].sid);
+		switch (c) {
+		case DSDB_TRUST_SID_ALWAYS_FILTER:
+			filter = true;
+			break;
+		case DSDB_TRUST_SID_NEVER_FILTER:
+		case DSDB_TRUST_SID_EDC:
+			break;
+		case DSDB_TRUST_SID_DOMAIN:
+			if (quarantined &&
+			    (trusted_sid == NULL ||
+			     !dom_sid_in_domain(trusted_sid, &sids[i].sid)))
+			{
+				filter = true;
+			}
+			break;
+		}
+
+		if (!filter) {
+			sids[n++] = sids[i];
+			continue;
+		}
+
+		if (i < 2) {
+			DBG_WARNING("%s: the %s SID %s does not pass the "
+				    "SID filtering of the trust\n",
+				    source,
+				    i == 0 ? "user" : "primary group",
+				    dom_sid_str_buf(&sids[i].sid, &buf));
+			return NT_STATUS_ACCESS_DENIED;
+		}
+
+		DBG_NOTICE("%s: SID %s removed by the SID filtering of the "
+			   "%s trust\n",
+			   source,
+			   dom_sid_str_buf(&sids[i].sid, &buf),
+			   quarantined ? "quarantined intra-forest" :
+					 "intra-forest");
+	}
+	*num_sids = n;
+
 	return NT_STATUS_OK;
 }
