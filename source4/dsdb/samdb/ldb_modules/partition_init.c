@@ -197,6 +197,20 @@ static const char **find_modules_for_dn(struct partition_private_data *data, str
 	}
 }
 
+/* is there an option starting with prefix in the list? */
+static bool str_list_has_prefix(const char **list, const char *prefix)
+{
+	size_t len = strlen(prefix);
+	size_t i;
+
+	for (i = 0; list != NULL && list[i] != NULL; i++) {
+		if (strncmp(list[i], prefix, len) == 0) {
+			return true;
+		}
+	}
+	return false;
+}
+
 static int new_partition_from_dn(struct ldb_context *ldb, struct partition_private_data *data, 
 				 TALLOC_CTX *mem_ctx, 
 				 struct ldb_dn *dn, const char *filename,
@@ -265,6 +279,34 @@ static int new_partition_from_dn(struct ldb_context *ldb, struct partition_priva
 		 * backend database.
 		 */
 		unsigned int flags = ldb_module_flags(ldb);
+
+		/*
+		 * Without an explicit map size, a new LMDB database
+		 * gets the LMDB default (1 MiB), far too small for the
+		 * partial replica of a whole domain: use the default
+		 * size of a provision (8 GiB, only reserved address
+		 * space).
+		 */
+		if (strcmp(backend_db_store, "mdb") == 0 &&
+		    !str_list_has_prefix(options, "lmdb_env_size:"))
+		{
+			size_t n = str_list_length(options);
+			const char **new_options = NULL;
+			size_t i;
+
+			new_options = talloc_zero_array(*partition,
+							const char *,
+							n + 2);
+			if (new_options == NULL) {
+				talloc_free(*partition);
+				return ldb_oom(ldb);
+			}
+			for (i = 0; i < n; i++) {
+				new_options[i] = options[i];
+			}
+			new_options[n] = "lmdb_env_size:8589934592";
+			options = new_options;
+		}
 
 		ldb_set_flags(ldb, flags & ~LDB_FLG_DONT_CREATE_DB);
 		ret = ldb_module_connect_backend(
