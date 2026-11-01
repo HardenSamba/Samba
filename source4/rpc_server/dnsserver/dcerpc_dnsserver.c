@@ -40,14 +40,6 @@ static NTSTATUS dcesrv_interface_dnsserver_bind(struct dcesrv_connection_context
 }
 
 #define DNSSERVER_STATE_MAGIC 0xc9657ab4
-struct dnsserver_state {
-	struct loadparm_context *lp_ctx;
-	struct ldb_context *samdb;
-	struct dnsserver_partition *partitions;
-	struct dnsserver_zone *zones;
-	int zones_count;
-	struct dnsserver_serverinfo *serverinfo;
-};
 
 
 /* Utility functions */
@@ -62,7 +54,9 @@ static void dnsserver_reload_zones(struct dnsserver_state *dsstate)
 	new_list = NULL;
 
 	for (p = dsstate->partitions; p; p = p->next) {
-		zones = dnsserver_db_enumerate_zones(dsstate, dsstate->samdb, p);
+		bool failed = false;
+
+		zones = dnsserver_harden_enumerate_zones(dsstate, p, &failed);
 		if (zones == NULL) {
 			continue;
 		}
@@ -73,8 +67,32 @@ static void dnsserver_reload_zones(struct dnsserver_state *dsstate)
 				/* Missing zone */
 				z->zoneinfo = dnsserver_init_zoneinfo(z, dsstate->serverinfo);
 				if (z->zoneinfo == NULL) {
+					z = znext;
 					continue;
 				}
+				dnsserver_harden_fix_zoneinfo(dsstate, z);
+				DLIST_ADD_END(new_list, z);
+				p->zones_count++;
+				dsstate->zones_count++;
+			} else if (dns_harden_enabled(&dsstate->harden)) {
+				/*
+				 * Existing zone, its properties may have
+				 * changed (masters, forwarder timeout...)
+				 */
+				z->zoneinfo = dnsserver_init_zoneinfo(
+					z, dsstate->serverinfo);
+				if (z->zoneinfo == NULL) {
+					talloc_free(z);
+					DLIST_REMOVE(old_list, zmatch);
+					DLIST_ADD_END(new_list, zmatch);
+					z = znext;
+					continue;
+				}
+				dnsserver_harden_fix_zoneinfo(dsstate, z);
+				DLIST_REMOVE(old_list, zmatch);
+				zmatch->partition->zones_count--;
+				dsstate->zones_count--;
+				talloc_free(zmatch);
 				DLIST_ADD_END(new_list, z);
 				p->zones_count++;
 				dsstate->zones_count++;
@@ -125,6 +143,9 @@ static struct dnsserver_state *dnsserver_connect(struct dcesrv_call_state *dce_c
 	}
 
 	dsstate->lp_ctx = dce_call->conn->dce_ctx->lp_ctx;
+	dsstate->ev = dce_call->event_ctx;
+	dsstate->session_info = dcesrv_call_session_info(dce_call);
+	dns_harden_get_options(dsstate->lp_ctx, &dsstate->harden);
 
 	dsstate->samdb = dcesrv_samdb_connect_as_user(dsstate, dce_call);
 	if (dsstate->samdb == NULL) {
@@ -146,11 +167,15 @@ static struct dnsserver_state *dnsserver_connect(struct dcesrv_call_state *dce_c
 		goto failed;
 	}
 	dsstate->partitions = partitions;
+	dnsserver_harden_add_partitions(dsstate);
 
 	/* Search for DNS zones */
-	for (p = partitions; p; p = p->next) {
-		zones = dnsserver_db_enumerate_zones(dsstate, dsstate->samdb, p);
-		if (zones == NULL) {
+	for (p = dsstate->partitions; p; p = p->next) {
+		bool enum_failed = false;
+
+		zones = dnsserver_harden_enumerate_zones(dsstate, p,
+							 &enum_failed);
+		if (enum_failed) {
 			goto failed;
 		}
 		for (z = zones; z; ) {
@@ -160,6 +185,7 @@ static struct dnsserver_state *dnsserver_connect(struct dcesrv_call_state *dce_c
 				if (z->zoneinfo == NULL) {
 					goto failed;
 				}
+				dnsserver_harden_fix_zoneinfo(dsstate, z);
 				DLIST_ADD_END(dsstate->zones, z);
 				p->zones_count++;
 				dsstate->zones_count++;
@@ -924,6 +950,10 @@ static WERROR dnsserver_query_zone(struct dnsserver_state *dsstate,
 			r->ZoneInfo->fUseDatabase = zoneinfo->fUseDatabase;
 			r->ZoneInfo->pszDataFile = talloc_strdup(mem_ctx, zoneinfo->pszDataFile);
 			r->ZoneInfo->aipMasters = ip4_array_to_dns_addr_array(mem_ctx, zoneinfo->aipMasters);
+			if (zoneinfo->aipMastersDa != NULL) {
+				r->ZoneInfo->aipMasters = dnsserver_harden_masters(
+					mem_ctx, zoneinfo);
+			}
 			r->ZoneInfo->fSecureSecondaries = zoneinfo->fSecureSecondaries;
 			r->ZoneInfo->fNotifyLevel = zoneinfo->fNotifyLevel;
 			r->ZoneInfo->aipSecondaries = ip4_array_to_dns_addr_array(mem_ctx, zoneinfo->aipSecondaries);
@@ -1017,6 +1047,10 @@ static WERROR dnsserver_query_zone(struct dnsserver_state *dsstate,
 	} else if (strcasecmp(operation, "MasterServers") == 0) {
 		if (client_version == DNS_CLIENT_VERSION_LONGHORN) {
 			answer_addrarray = ip4_array_to_dns_addr_array(mem_ctx, zoneinfo->aipMasters);
+			if (zoneinfo->aipMastersDa != NULL) {
+				answer_addrarray = dnsserver_harden_masters(
+					mem_ctx, zoneinfo);
+			}
 		} else {
 			answer_iparray = ip4_array_copy(mem_ctx, zoneinfo->aipMasters);
 		}
@@ -1100,6 +1134,16 @@ static WERROR dnsserver_operate_server(struct dnsserver_state *dsstate,
 		valid_operation = true;
 	} else if (strcasecmp(operation, "WriteDirtyZones") == 0) {
 		valid_operation = true;
+	} else if (strcasecmp(operation, "ZoneCreate") == 0 &&
+		   dns_harden_enabled(&dsstate->harden)) {
+		WERROR status;
+
+		status = dnsserver_harden_create_zone(dsstate, mem_ctx,
+						      typeid, r);
+		if (W_ERROR_IS_OK(status)) {
+			dnsserver_reload_zones(dsstate);
+		}
+		return status;
 	} else if (strcasecmp(operation, "ZoneCreate") == 0) {
 		struct dnsserver_zone *z, *z2;
 		WERROR status;
@@ -1245,6 +1289,19 @@ static WERROR dnsserver_complex_operate_server(struct dnsserver_state *dsstate,
 		zcount = 0;
 		zlist = talloc_zero_array(mem_ctx, struct dnsserver_zone *, 0);
 		for (z = dsstate->zones; z; z = z->next) {
+
+			if (dns_harden_enabled(&dsstate->harden)) {
+				if (!dnsserver_harden_zone_matches(z,
+								   rin->Dword)) {
+					continue;
+				}
+				zlist = talloc_realloc(mem_ctx, zlist,
+						       struct dnsserver_zone *,
+						       zcount+1);
+				zlist[zcount] = z;
+				zcount++;
+				continue;
+			}
 
 			/* Match the flags in groups
 			 *
@@ -1428,6 +1485,11 @@ static WERROR dnsserver_complex_operate_server(struct dnsserver_state *dsstate,
 
 			p = dsstate->partitions;
 			for (i=0; i<pcount; i++) {
+				/*
+				 * Only the 2 built-in partitions (the
+				 * Harden-Box legacy partition and local
+				 * zone store come after them)
+				 */
 				dplist[i] = talloc_zero(dplist, struct DNS_RPC_DP_ENUM);
 
 				dplist[i]->pszDpFqdn = talloc_strdup(mem_ctx, p->pszDpFqdn);
@@ -1452,6 +1514,9 @@ static WERROR dnsserver_complex_operate_server(struct dnsserver_state *dsstate,
 		*typeid_out = DNSSRV_TYPEID_DP_INFO;
 
 		for (p = dsstate->partitions; p; p = p->next) {
+			if (p->is_legacy || p->is_local) {
+				continue;
+			}
 			if (strcasecmp(p->pszDpFqdn, rin->String) == 0) {
 				dpinfo = talloc_zero(mem_ctx, struct DNS_RPC_DP_INFO);
 				W_ERROR_HAVE_NO_MEMORY(dpinfo);
@@ -1509,6 +1574,21 @@ static WERROR dnsserver_operate_zone(struct dnsserver_state *dsstate,
 {
 	bool valid_operation = false;
 
+	{
+		bool handled = false;
+		WERROR status;
+
+		status = dnsserver_harden_operate_zone(dsstate, mem_ctx, z,
+						       operation, typeid, r,
+						       &handled);
+		if (handled) {
+			if (W_ERROR_IS_OK(status)) {
+				dnsserver_reload_zones(dsstate);
+			}
+			return status;
+		}
+	}
+
 	if (strcasecmp(operation, "ResetDwordProperty") == 0) {
 
 		if (typeid != DNSSRV_TYPEID_NAME_AND_PARAM) {
@@ -1538,11 +1618,17 @@ static WERROR dnsserver_operate_zone(struct dnsserver_state *dsstate,
 		valid_operation = true;
 	} else if (strcasecmp(operation, "DeleteZoneFromDs") == 0) {
 		WERROR status;
+		bool forward_zone = false;
 		if (z == NULL) {
 			return WERR_DNS_ERROR_ZONE_DOES_NOT_EXIST;
 		}
+		forward_zone = dns_harden_enabled(&dsstate->harden) &&
+			dnsserver_harden_is_forward_zone(z);
 		status =  dnsserver_db_delete_zone(dsstate->samdb, z);
 		if (W_ERROR_IS_OK(status)) {
+			if (forward_zone) {
+				dnsserver_harden_notify_dns_server(dsstate);
+			}
 			dnsserver_reload_zones(dsstate);
 		}
 		return status;
@@ -1738,6 +1824,12 @@ static WERROR dnsserver_enumerate_records(struct dnsserver_state *dsstate,
 	const char *preference_name = NULL;
 	int add_count = 0;
 	int i, ret, len;
+
+	if (dns_harden_enabled(&dsstate->harden) &&
+	    (dnsserver_harden_is_forward_zone(z) || z->partition->is_local)) {
+		/* the records of these zones are on their masters */
+		return WERR_DNS_ERROR_NAME_DOES_NOT_EXIST;
+	}
 	WERROR status;
 	struct dns_tree *tree = NULL;
 	struct dns_tree *base = NULL;
@@ -1926,6 +2018,11 @@ static WERROR dnsserver_update_record(struct dnsserver_state *dsstate,
 	TALLOC_CTX *tmp_ctx;
 	char *name;
 	WERROR status;
+
+	if (dns_harden_enabled(&dsstate->harden) &&
+	    (dnsserver_harden_is_forward_zone(z) || z->partition->is_local)) {
+		return WERR_DNS_ERROR_INVALID_ZONE_TYPE;
+	}
 
 	tmp_ctx = talloc_new(mem_ctx);
 	W_ERROR_HAVE_NO_MEMORY(tmp_ctx);

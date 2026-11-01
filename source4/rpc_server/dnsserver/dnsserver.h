@@ -26,6 +26,7 @@
 #include "librpc/gen_ndr/dnsserver.h"
 #include "param/param.h"
 #include "ldb.h"
+#include "dns_server/dns_harden_common.h"
 
 /*
  * See [MS-DNSP] 2.3.2.1.1 Property Id
@@ -153,6 +154,12 @@ struct dnsserver_zoneinfo {
 
 	uint32_t	dwLastXfrAttempt;
 	uint32_t	dwLastXfrResult;
+
+	/*
+	 * Harden-Box: the masters of a conditional forwarder or a stub
+	 * zone, IPv6 included, for the DNS_ADDR_ARRAY of LONGHORN clients
+	 */
+	struct DNS_ADDR_ARRAY *aipMastersDa;
 };
 
 
@@ -163,6 +170,10 @@ struct dnsserver_partition {
 	uint32_t dwDpFlags;
 	bool is_forest;
 	int zones_count;
+	/* Harden-Box: CN=MicrosoftDNS,CN=System,<domain NC> */
+	bool is_legacy;
+	/* Harden-Box: the local zone store (not AD-integrated zones) */
+	bool is_local;
 };
 
 
@@ -182,6 +193,20 @@ struct dnsserver_zone {
 	struct dnsserver_zoneinfo *zoneinfo;
 	struct dnsp_DnsProperty *tmp_props;
 	int32_t num_props;
+};
+
+struct dnsserver_state {
+	struct loadparm_context *lp_ctx;
+	struct ldb_context *samdb;
+	struct dnsserver_partition *partitions;
+	struct dnsserver_zone *zones;
+	int zones_count;
+	struct dnsserver_serverinfo *serverinfo;
+	/* Harden-Box options, local zone store (see dnsharden.c) */
+	struct dns_harden_options harden;
+	struct ldb_context *local_ldb;
+	struct tevent_context *ev;
+	struct auth_session_info *session_info;
 };
 
 
@@ -276,5 +301,42 @@ WERROR dnsserver_db_create_zone(struct ldb_context *samdb,
 				struct loadparm_context *lp_ctx);
 WERROR dnsserver_db_delete_zone(struct ldb_context *samdb,
 				struct dnsserver_zone *z);
+WERROR dnsserver_db_do_create_zone(TALLOC_CTX *tmp_ctx,
+				   struct ldb_context *samdb,
+				   struct ldb_dn *zone_dn,
+				   struct dnsserver_zone *z);
+WERROR dnsserver_db_create_zone_in(struct ldb_context *samdb,
+				   struct dnsserver_partition *p,
+				   struct dnsserver_zone *zone,
+				   struct loadparm_context *lp_ctx);
+
+/* Harden-Box: conditional forwarders, stub zones, legacy partition */
+struct dcesrv_call_state;
+void dnsserver_harden_add_partitions(struct dnsserver_state *dsstate);
+struct dnsserver_zone *dnsserver_harden_enumerate_zones(
+	struct dnsserver_state *dsstate,
+	struct dnsserver_partition *p,
+	bool *failed);
+void dnsserver_harden_fix_zoneinfo(struct dnsserver_state *dsstate,
+				   struct dnsserver_zone *z);
+bool dnsserver_harden_zone_matches(struct dnsserver_zone *z,
+				   uint32_t filter);
+bool dnsserver_harden_is_forward_zone(struct dnsserver_zone *z);
+struct DNS_ADDR_ARRAY *dnsserver_harden_masters(TALLOC_CTX *mem_ctx,
+						struct dnsserver_zoneinfo *zi);
+WERROR dnsserver_harden_create_zone(struct dnsserver_state *dsstate,
+				    TALLOC_CTX *mem_ctx,
+				    enum DNS_RPC_TYPEID typeid,
+				    union DNSSRV_RPC_UNION *r);
+WERROR dnsserver_harden_operate_zone(struct dnsserver_state *dsstate,
+				     TALLOC_CTX *mem_ctx,
+				     struct dnsserver_zone *z,
+				     const char *operation,
+				     enum DNS_RPC_TYPEID typeid,
+				     union DNSSRV_RPC_UNION *r,
+				     bool *handled);
+struct ldb_context *dnsserver_zone_ldb(struct dnsserver_state *dsstate,
+				       struct dnsserver_zone *z);
+void dnsserver_harden_notify_dns_server(struct dnsserver_state *dsstate);
 
 #endif /* __DNSSERVER_H__ */

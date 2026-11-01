@@ -1052,7 +1052,7 @@ WERROR dnsserver_db_do_reset_dword(struct ldb_context *samdb,
 }
 
 /* Create dnsZone record to database and set security descriptor */
-static WERROR dnsserver_db_do_create_zone(TALLOC_CTX *tmp_ctx,
+WERROR dnsserver_db_do_create_zone(TALLOC_CTX *tmp_ctx,
 					  struct ldb_context *samdb,
 					  struct ldb_dn *zone_dn,
 					  struct dnsserver_zone *z)
@@ -1211,14 +1211,6 @@ WERROR dnsserver_db_create_zone(struct ldb_context *samdb,
 {
 	struct dnsserver_partition *p;
 	bool in_forest = false;
-	WERROR status;
-	struct ldb_dn *dn;
-	TALLOC_CTX *tmp_ctx;
-	struct dnsp_DnssrvRpcRecord *dns_rec;
-	struct dnsp_soa soa;
-	char *soa_email = NULL;
-	const char *dnsdomain = NULL;
-	struct ldb_val name_val = data_blob_string_const(zone->name);
 
 	/* We only support primary zones for now */
 	if (zone->zoneinfo->dwZoneType != DNS_ZONE_TYPE_PRIMARY) {
@@ -1230,6 +1222,9 @@ WERROR dnsserver_db_create_zone(struct ldb_context *samdb,
 		in_forest = true;
 	}
 	for (p = partitions; p; p = p->next) {
+		if (p->is_legacy || p->is_local) {
+			continue;
+		}
 		if (in_forest == p->is_forest) {
 			break;
 		}
@@ -1237,6 +1232,24 @@ WERROR dnsserver_db_create_zone(struct ldb_context *samdb,
 	if (p == NULL) {
 		return WERR_DNS_ERROR_DP_DOES_NOT_EXIST;
 	}
+
+	return dnsserver_db_create_zone_in(samdb, p, zone, lp_ctx);
+}
+
+/* Create new dnsZone record and @ record (SOA + NS) in partition p */
+WERROR dnsserver_db_create_zone_in(struct ldb_context *samdb,
+				   struct dnsserver_partition *p,
+				   struct dnsserver_zone *zone,
+				   struct loadparm_context *lp_ctx)
+{
+	WERROR status;
+	struct ldb_dn *dn;
+	TALLOC_CTX *tmp_ctx;
+	struct dnsp_DnssrvRpcRecord *dns_rec;
+	struct dnsp_soa soa;
+	char *soa_email = NULL;
+	const char *dnsdomain = NULL;
+	struct ldb_val name_val = data_blob_string_const(zone->name);
 
 	tmp_ctx = talloc_new(NULL);
 	W_ERROR_HAVE_NO_MEMORY(tmp_ctx);
