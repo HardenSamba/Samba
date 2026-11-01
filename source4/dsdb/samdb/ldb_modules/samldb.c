@@ -3405,9 +3405,71 @@ static int samldb_group_type_change(struct samldb_ctx *ac)
 	return LDB_SUCCESS;
 }
 
+/*
+ * A member that belongs to another domain of our forest (we find it in
+ * the partial replica of its domain, on a global catalog) may only be
+ * added to a universal or a domain local group, and may not be a
+ * domain local group itself (the group scope rules of Active
+ * Directory).
+ */
+static int samldb_member_check_other_domain(struct samldb_ctx *ac,
+					    struct ldb_dn *member_dn,
+					    uint32_t group_type,
+					    const struct ldb_message *member)
+{
+	struct ldb_context *ldb = ldb_module_get_ctx(ac->module);
+	const struct dom_sid *our_sid = samdb_domain_sid(ldb);
+	struct dom_sid *member_sid = NULL;
+	struct dom_sid member_domain;
+	uint32_t member_group_type;
+
+	if (our_sid == NULL) {
+		return LDB_SUCCESS;
+	}
+	if (samdb_find_attribute(ldb, member, "objectClass",
+				 "foreignSecurityPrincipal") != NULL) {
+		return LDB_SUCCESS;
+	}
+	member_sid = samdb_result_dom_sid(ac, member, "objectSid");
+	if (member_sid == NULL) {
+		return LDB_SUCCESS;
+	}
+	member_domain = *member_sid;
+	if (!sid_split_rid(&member_domain, NULL)) {
+		return LDB_SUCCESS;
+	}
+	if (dom_sid_equal(&member_domain, our_sid) ||
+	    dom_sid_equal(&member_domain, &global_sid_Builtin)) {
+		return LDB_SUCCESS;
+	}
+
+	if (group_type & GROUP_TYPE_ACCOUNT_GROUP) {
+		ldb_asprintf_errstring(ldb,
+				       "samldb: %s is in another domain, it "
+				       "can't be a member of the global group "
+				       "%s",
+				       ldb_dn_get_linearized(member_dn),
+				       ldb_dn_get_linearized(ac->msg->dn));
+		return LDB_ERR_UNWILLING_TO_PERFORM;
+	}
+
+	member_group_type = ldb_msg_find_attr_as_uint(member, "groupType", 0);
+	if (member_group_type & GROUP_TYPE_RESOURCE_GROUP) {
+		ldb_asprintf_errstring(ldb,
+				       "samldb: %s is a domain local group of "
+				       "another domain, it can't be a member "
+				       "of %s",
+				       ldb_dn_get_linearized(member_dn),
+				       ldb_dn_get_linearized(ac->msg->dn));
+		return LDB_ERR_UNWILLING_TO_PERFORM;
+	}
+
+	return LDB_SUCCESS;
+}
+
 static int samldb_member_check(struct samldb_ctx *ac)
 {
-	const char * const attrs[] = { "objectSid", NULL };
+	const char * const attrs[] = { "objectSid", "groupType", NULL };
 	struct ldb_context *ldb = ldb_module_get_ctx(ac->module);
 	struct ldb_message_element *el;
 	struct ldb_dn *member_dn;
@@ -3443,7 +3505,11 @@ static int samldb_member_check(struct samldb_ctx *ac)
 		el = &ac->msg->elements[i];
 		for (j = 0; j < el->num_values; j++) {
 			struct ldb_result *group_res;
-			const char *group_attrs[] = { "primaryGroupID" , NULL };
+			const char *group_attrs[] = { "primaryGroupID",
+						      "objectSid",
+						      "objectClass",
+						      "groupType",
+						      NULL };
 			uint32_t prim_group_rid;
 
 			if (LDB_FLAG_MOD_TYPE(el->flags) == LDB_FLAG_MOD_DELETE) {
@@ -3472,6 +3538,14 @@ static int samldb_member_check(struct samldb_ctx *ac)
 				/* member DN doesn't exist yet */
 				continue;
 			}
+			if (ret != LDB_SUCCESS) {
+				return ret;
+			}
+			ret = samldb_member_check_other_domain(
+				ac, member_dn,
+				ldb_msg_find_attr_as_uint(res->msgs[0],
+							  "groupType", 0),
+				group_res->msgs[0]);
 			if (ret != LDB_SUCCESS) {
 				return ret;
 			}
