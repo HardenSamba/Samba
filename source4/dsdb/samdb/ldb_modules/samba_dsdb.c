@@ -198,6 +198,7 @@ static int samba_dsdb_init(struct ldb_module *module)
 					     "ranged_results",
 					     "anr",
 					     "server_sort",
+					     "onelevel_order",
 					     "asq",
 					     "extended_dn_store",
 					     NULL };

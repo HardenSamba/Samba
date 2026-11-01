@@ -229,6 +229,16 @@ bld.SAMBA_MODULE('ldb_extended_dn_store',
 	)
 
 
+bld.SAMBA_MODULE('ldb_onelevel_order',
+	source='onelevel_order.c',
+	subsystem='ldb',
+	init_function='ldb_onelevel_order_module_init',
+	module_init_name='ldb_init_module',
+	internal_module=False,
+	deps='talloc samba-util samba-hostconfig DSDB_MODULE_HELPERS'
+	)
+
+
 bld.SAMBA_MODULE('ldb_show_deleted',
 	source='show_deleted.c',
 	subsystem='ldb',
