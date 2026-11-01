@@ -20,12 +20,21 @@ dans [README.md](README.md), après la partie Harden-Box.
 > enfant (qui contient désormais le domaine racine), les partitions de
 > la forêt sur le DC enfant, les rôles de maître d'infrastructure et de
 > maître d'attribution des noms de domaine, la vue de la forêt dans
-> Netlogon et le filtrage de SID à l'intérieur de la forêt. Plusieurs
-> points manquent encore, voir [Limites connues](#limites-connues).
+> Netlogon et le filtrage de SID à l'intérieur de la forêt. La phase 4
+> fait de chaque fonctionnalité une option de `smb.conf`, désactivée par
+> défaut (sans aucune d'elles, le DC se comporte comme un DC de la
+> branche master de Samba), désactive le rôle de maître d'infrastructure
+> sur un catalogue global comme Windows, et ajoute au serveur DNS interne
+> les redirecteurs conditionnels et les zones de stub, le choix de la
+> partition d'une nouvelle zone DNS, la corbeille AD telle que Windows la
+> gère et l'ordre alphabétique des objets dans Utilisateurs et
+> ordinateurs Active Directory. Plusieurs points manquent encore, voir
+> [Limites connues](#limites-connues).
 
 - Base : `master` de Samba au commit `f6fddd2232c9` (4.26.0pre1, 30/10/2026)
-- Branche : `_Harden-Box-Multi-domains-supports-phase3`, au-dessus de
-  `_Harden-Box-Multi-domains-supports-phase2` (elle-même au-dessus de
+- Branche : `_Harden-Box-Multi-domains-supports-phase4`, au-dessus de
+  `_Harden-Box-Multi-domains-supports-phase3` (elle-même au-dessus de
+  `_Harden-Box-Multi-domains-supports-phase2` et
   `_Harden-Box-Multi-domains-supports-phase1`)
 - Phase 1 : 11 commits de code pour le multi-domaine, 1 commit qui fait
   annoncer Active Directory Web Services par le DC (voir
@@ -34,8 +43,13 @@ dans [README.md](README.md), après la partie Harden-Box.
 - Phase 2 : 15 commits de code (numérotés de 13 à 27 dans
   [Modifications en détail](#modifications-en-détail)) et leur
   documentation
-- Phase 3 : 19 commits de code (numérotés de 28 à 46) et cette
+- Phase 3 : 19 commits de code (numérotés de 28 à 46) et leur
   documentation
+- Phase 4 : 14 commits de code (numérotés de 47 à 60) et cette
+  documentation ; la restauration des objets supprimés depuis le Centre
+  d'administration Active Directory demande aussi la branche
+  `fix/restore-deleted-objects` de samba-adws (voir
+  [Corbeille AD](#corbeille-ad))
 
 
 Contexte
@@ -61,13 +75,61 @@ winbindd), « TODO: handle multiple domains in a forest » (LSA), etc.
   groupes de la racine leur place dans le domaine enfant, fait répliquer
   les DC des deux domaines et permet à un catalogue global de contenir
   l'autre domaine.
-- La **phase 3** (cette branche) gère les références entre domaines
-  (membres d'un groupe venant d'un autre domaine, backlinks, groupes
-  universels dans les jetons, maître d'infrastructure), complète le
-  catalogue global d'un domaine enfant et les partitions de la forêt sur
-  son DC, met en place les contrôles du maître d'attribution des noms de
-  domaine, et revoit Netlogon et le filtrage de SID pour les domaines de
-  la forêt.
+- La **phase 3** gère les références entre domaines (membres d'un
+  groupe venant d'un autre domaine, backlinks, groupes universels dans
+  les jetons, maître d'infrastructure), complète le catalogue global
+  d'un domaine enfant et les partitions de la forêt sur son DC, met en
+  place les contrôles du maître d'attribution des noms de domaine, et
+  revoit Netlogon et le filtrage de SID pour les domaines de la forêt.
+- La **phase 4** (cette branche) fait de chaque fonctionnalité une option
+  de `smb.conf` (voir [Configuration](#configuration)), désactive le rôle
+  de maître d'infrastructure sur un catalogue global, et ajoute des
+  fonctionnalités qui ne sont pas propres aux forêts multi-domaines :
+  redirecteurs conditionnels et zones de stub dans le serveur DNS
+  interne, gérés depuis la console DNS d'une machine Windows, partition
+  d'une nouvelle zone DNS, corbeille AD, et ordre des objets dans
+  Utilisateurs et ordinateurs Active Directory.
+
+
+Configuration
+-------------
+
+Chaque fonctionnalité des branches Harden-Box s'active par une option
+paramétrique de la section `[global]` de `smb.conf`, **désactivée par
+défaut**. Sans aucune d'elles, le DC se comporte comme un DC de la
+branche master de Samba : chaque commit de la phase 4 dit ce que son
+option change, et la partie [Tests](#tests) liste les suites de
+non-régression lancées avec les options désactivées.
+
+| Option | Défaut | Active |
+|---|---|---|
+| `harden:multi-domain forest` | `no` | la prise en charge des forêts multi-domaines des phases 1 à 3 : domaines enfants, trusts `WITHIN_FOREST` dans le KDC, winbindd, NTLM, LSA et Netlogon, répliques partielles des autres domaines sur les catalogues globaux, membres venant d'un autre domaine, mise à jour du maître d'infrastructure... À mettre sur **tous les DC de la forêt**, y compris ceux du domaine racine. |
+| `harden:recycle bin` | `no` | la corbeille AD telle que Windows la gère, une fois activée dans la forêt, voir [Corbeille AD](#corbeille-ad) |
+| `harden:sort one-level results` | `no` | le tri par nom des recherches LDAP à un niveau, voir [Ordre des objets dans ADUC](#ordre-des-objets-dans-aduc) |
+| `harden:dns conditional forwarders` | `no` | les redirecteurs conditionnels du serveur DNS interne, voir [DNS](#dns--redirecteurs-conditionnels-zones-de-stub-et-partitions-des-zones) |
+| `harden:dns stub zones` | `no` | les zones de stub du serveur DNS interne |
+| `harden:dns default zone partition` | non défini | la partition d'une nouvelle zone DNS quand le client n'en indique pas : `domain` (DomainDnsZones, comme sur la branche master), `forest` (ForestDnsZones) ou `legacy` (`CN=MicrosoftDNS,CN=System` de la partition de domaine) ; toute valeur fait aussi gérer la partition `legacy` par le serveur RPC DNS |
+| `adws:advertise` | `no` | l'indicateur ADWS de la réponse netlogon (phase 1), voir [Annonce ADWS](#annonce-dactive-directory-web-services-adws) |
+| `kcc:infrastructure update interval` | `3600` | secondes entre deux mises à jour du maître d'infrastructure par le KCC (phase 3) |
+
+Par exemple, sur un DC d'une forêt multi-domaines qui les utilise
+toutes :
+
+```ini
+[global]
+    harden:multi-domain forest = yes
+    harden:recycle bin = yes
+    harden:sort one-level results = yes
+    harden:dns conditional forwarders = yes
+    harden:dns stub zones = yes
+    harden:dns default zone partition = forest
+```
+
+Redémarrer samba après une modification. Ce sont des options génériques
+(paramétriques) : `testparm` les affiche telles qu'elles sont écrites, et
+elles ne demandent aucune modification des tables de paramètres. Les
+options DNS concernent le serveur DNS interne
+(`--dns-backend=SAMBA_INTERNAL`), pas BIND9 DLZ.
 
 
 Utilisation
@@ -80,6 +142,7 @@ samba-tool domain join enfant.example.com SUBDOMAIN \
     --parent-domain=example.com \
     --server=dc1.example.com \
     --option="workgroup=ENFANT" \
+    --option="harden:multi-domain forest=yes" \
     -UAdministrator@EXAMPLE.COM \
     --adminpass='<mot de passe de l Administrator du nouveau domaine>'
 ```
@@ -93,9 +156,13 @@ samba-tool domain join enfant.example.com SUBDOMAIN \
   domaine).
 - Sans `--adminpass`, le mot de passe de l'Administrator du nouveau
   domaine est aléatoire.
-- Les DC du domaine parent doivent eux aussi tourner avec cette branche :
-  les modifications du KDC, de winbindd, de LSA, de la réplication et du
-  KCC sont nécessaires des deux côtés.
+- Les DC du domaine parent doivent eux aussi tourner avec cette branche,
+  avec `harden:multi-domain forest = yes` dans leur `smb.conf` (les
+  redémarrer après l'ajout) : les modifications du KDC, de winbindd, de
+  LSA, de la réplication et du KCC sont nécessaires des deux côtés.
+- Le join refuse de se lancer sans `harden:multi-domain forest = yes`
+  (phase 4). Donnée par `--option` (sans espace autour du `=`), l'option
+  est écrite dans le `smb.conf` du nouveau DC.
 
 Ce que fait le join :
 
@@ -149,11 +216,163 @@ samba-tool domain infrastructure-update -H /var/lib/samba/private/sam.ldb \
     [--gc=ldap://<catalogue global>:3268] [--dry-run] [--force]
 ```
 
-`--gc` ne sert que sur un DC qui n'est pas catalogue global et qui ne
-trouve pas de GC tout seul ; `--force` le lance sur un DC qui n'est pas
-le maître d'infrastructure. L'intervalle de l'exécution par le KCC se
-règle avec `kcc:infrastructure update interval = <secondes>` dans
-`smb.conf`.
+`--gc` ne sert que quand le DC ne trouve pas de catalogue global tout
+seul ; `--force` le lance sur un DC qui n'est pas le maître
+d'infrastructure. L'intervalle de l'exécution par le KCC se règle avec
+`kcc:infrastructure update interval = <secondes>` dans `smb.conf`.
+
+Comme sous Windows, le rôle de maître d'infrastructure ne fait rien sur
+un DC catalogue global (phase 4) : le KCC et `samba-tool domain
+infrastructure-update` indiquent pourquoi dans le journal et s'arrêtent.
+Quand certains DC du domaine ne sont pas catalogue global, le message
+les nomme et demande de transférer le rôle à l'un d'eux
+(`samba-tool fsmo transfer --role=infrastructure` sur ce DC) ; quand tous
+les DC du domaine sont catalogue global, le rôle ne sert pas.
+
+
+DNS : redirecteurs conditionnels, zones de stub et partitions des zones
+-----------------------------------------------------------------------
+
+Avec `harden:dns conditional forwarders = yes` et
+`harden:dns stub zones = yes` (serveur DNS interne), la console DNS d'une
+machine Windows (`dnsmgmt.msc`, connectée au DC) crée, modifie et
+supprime :
+
+- des **redirecteurs conditionnels** (*Redirecteurs conditionnels >
+  Nouveau redirecteur conditionnel...*) : le domaine DNS, les adresses IP
+  de ses serveurs maîtres, le délai d'attente des requêtes redirigées, et
+  *Stocker ce redirecteur conditionnel dans Active Directory et le
+  répliquer comme suit* ;
+- des **zones de stub** (*Nouvelle zone... > Zone de stub*) : la zone,
+  ses serveurs maîtres, et si et où elle est stockée dans Active
+  Directory.
+
+Stockés dans Active Directory, ils sont répliqués sur tous les DC qui
+ont leur partition, comme les zones principales :
+
+| Choix de la console | Partition |
+|---|---|
+| Vers tous les serveurs DNS exécutés sur des contrôleurs de domaine dans cette forêt | ForestDnsZones |
+| Vers tous les serveurs DNS exécutés sur des contrôleurs de domaine dans ce domaine | DomainDnsZones du domaine |
+| Vers tous les contrôleurs de domaine dans ce domaine (pour la compatibilité Windows 2000) | `CN=MicrosoftDNS,CN=System` de la partition de domaine (la partition « legacy ») |
+
+Non stockés dans Active Directory, ils n'existent que sur le DC qui les
+a créés (dans `dns_local_zones.ldb`, dans le répertoire d'état ; sous
+Windows, un fichier dans `%windir%\System32\dns`) ; seul un
+administrateur les crée, les modifie ou les supprime.
+
+Le serveur DNS envoie une requête pour un nom d'un redirecteur
+conditionnel à ses serveurs maîtres, puis, sauf si le redirecteur
+interdit la récursivité, aux redirecteurs globaux (`dns forwarder`) ;
+une requête pour un nom d'une zone de stub ne va qu'à ses serveurs
+maîtres. Une zone plus précise du DC l'emporte.
+
+La même chose avec `samba-tool` :
+
+```
+samba-tool dns zonecreate dc1 example.org --type=forwarder \
+    --master=192.0.2.53 --master=2001:db8::53 --forwarder-timeout=3 \
+    --dns-directory-partition=forest -UAdministrator
+samba-tool dns zonecreate dc1 partenaire.test --type=stub \
+    --master=192.0.2.10 --dns-directory-partition=legacy -UAdministrator
+samba-tool dns zonecreate dc1 labo.test --type=forwarder \
+    --master=192.0.2.99 --not-ds-integrated -UAdministrator
+samba-tool dns zonelist dc1 --forwarder -UAdministrator
+samba-tool dns zonedelete dc1 example.org -UAdministrator
+```
+
+**Partition d'une nouvelle zone.** Avec
+`harden:dns default zone partition = domain|forest|legacy`, une zone
+créée sans partition (`samba-tool dns zonecreate` sans
+`--dns-directory-partition`, `dnscmd /ZoneAdd ... /DsPrimary` sans
+`/DP`) va dans cette partition, zones principales comprises. Sans
+l'option, elle va dans DomainDnsZones, comme sur la branche master.
+
+Mettre les options DNS sur **tous les DC qui ont la partition** de ces
+zones (tous les DC de la forêt pour ForestDnsZones) : un DC sans elles
+charge un redirecteur conditionnel ou une zone de stub comme une zone
+principale vide, et répond que ses noms n'existent pas.
+
+
+Corbeille AD
+------------
+
+La corbeille est une fonctionnalité optionnelle de la forêt. Samba en
+avait déjà l'essentiel, mais un DC ne la voyait activée que si son
+propre objet nTDSDSA l'indiquait, la restauration d'un objet supprimé
+échouait une fois la corbeille activée (`noSuchAttribute`), et un
+administrateur ne pouvait pas l'activer. Avec `harden:recycle bin = yes`,
+sur tous les DC de la forêt, un DC se comporte comme un DC Windows
+([MS-ADTS] 3.1.1.5.5, 3.1.1.5.3.7 et 3.1.1.9.1).
+
+**Activation** (niveau fonctionnel de forêt 2008 R2 ou plus, par un
+Enterprise Admin ; elle ne peut pas être désactivée). Depuis une machine
+Windows, avec le service ADWS de HardenSamba (branche
+`fix/restore-deleted-objects` de samba-adws) : l'action *Activer la
+Corbeille...* du Centre d'administration Active Directory, ou
+
+```
+Enable-ADOptionalFeature 'Recycle Bin Feature' -Scope ForestOrConfigurationSet -Target example.com
+```
+
+Ou sur un DC, en root :
+
+```
+ldbmodify -H /var/lib/samba/private/sam.ldb <<'END'
+dn:
+changetype: modify
+add: enableOptionalFeature
+enableOptionalFeature: CN=Partitions,CN=Configuration,DC=example,DC=com:766ddcd8-acd0-445e-f3b9-a7f9b6744f2a
+END
+```
+
+Une fois activée :
+
+| État | `isDeleted` | `isRecycled` | Attributs et liens | Restauration |
+|---|---|---|---|---|
+| objet supprimé (pendant `msDS-DeletedObjectLifetime`, sinon la durée de vie des tombstones) | `TRUE` | absent | conservés ; les liens sont désactivés (masqués sans le contrôle `LDAP_SERVER_SHOW_DEACTIVATED_LINK`) | oui, avec ses attributs et ses liens |
+| objet recyclé (effacé après la durée de vie des tombstones) | `TRUE` | `TRUE` | supprimés, comme pour un tombstone | non (`unwillingToPerform`) |
+| tombstone créé avant l'activation de la corbeille | `TRUE` | `TRUE` (positionné à l'activation) | supprimés | non |
+
+Supprimer un objet supprimé (vider la corbeille) le recycle. Une
+restauration est une seule modification de l'objet supprimé, comme sous
+Windows : suppression de `isDeleted` et remplacement de
+`distinguishedName`, avec le contrôle `show_deleted` :
+
+```
+ldbmodify -H ldap://dc1 -UAdministrator --controls=show_deleted:1 <<'END'
+dn: <GUID=5e3ea2a3-0b5c-4c4f-a3a6-7b0e0a29a6b2>
+changetype: modify
+delete: isDeleted
+-
+replace: distinguishedName
+distinguishedName: CN=Jeanne Dupont,OU=Personnel,DC=example,DC=com
+END
+```
+
+Le nouveau parent doit exister (sinon `noSuchObject`,
+`ERROR_DS_NO_PARENT_OBJECT` : restaurer d'abord le parent supprimé).
+`Restore-ADObject` et les actions *Restaurer* / *Restaurer dans...* du
+Centre d'administration Active Directory fonctionnent avec le service
+ADWS de HardenSamba, branche `fix/restore-deleted-objects`, qui les
+traduit en cette modification (le Centre d'administration affiche les
+objets supprimés depuis la branche
+`fix/get-forwards-visibility-controls`).
+
+
+Ordre des objets dans ADUC
+--------------------------
+
+Utilisateurs et ordinateurs Active Directory affiche les objets d'un
+conteneur dans l'ordre où le DC les renvoie. Un DC Windows répond à une
+recherche à un niveau par son index sur le parent et le nom : les objets
+reviennent par ordre alphabétique ; Samba les renvoyait dans l'ordre de
+son propre index (par GUID). Avec `harden:sort one-level results = yes`,
+les recherches à un niveau qui viennent de LDAP et ne demandent pas
+elles-mêmes d'ordre (tri côté serveur, VLV) sont triées par nom (sans
+tenir compte de la casse), pages d'une recherche paginée comprises.
+L'ordre de Windows est déduit de son comportement, pas d'une
+spécification.
 
 
 Ce qui fonctionne
@@ -254,6 +473,42 @@ Phase 3 :
   `samba-tool domain infrastructure-update` ;
 - **KCC :** `samba.tests.kcc` passe sur `promoted_dc` et `vampire_dc`
   avec un domaine enfant dans la forêt.
+
+
+Phase 4 :
+
+- **options :** sans aucune option `harden:`, le DC se comporte comme sur
+  la branche master (les suites de non-régression listées dans
+  [Tests](#tests) passent sur les environnements selftest qui ne les
+  activent pas) ; `samba-tool domain join ... SUBDOMAIN` refuse de se
+  lancer sans `harden:multi-domain forest` ;
+- **maître d'infrastructure sur un GC :** le rôle ne fait rien sur un
+  catalogue global, et indique quels DC du domaine pourraient le tenir ;
+- **DNS** (DC enfant, serveur DNS interne) : un redirecteur conditionnel
+  créé dans DomainDnsZones avec un maître sur le DC parent résout les
+  noms de la zone du parent par lui, est listé et décrit comme un
+  redirecteur (maîtres avec IPv6, délai, récursivité), refuse les
+  enregistrements, est modifié (maîtres, délai, récursivité) et
+  supprimé ; de même pour un redirecteur conditionnel stocké sur le DC
+  seulement et pour une zone de stub dans ForestDnsZones ; une zone
+  créée sans partition va dans la partition de
+  `harden:dns default zone partition`, et une zone peut être créée dans
+  la partition legacy ; le DC parent, sans les options, refuse les
+  redirecteurs conditionnels et les zones de stub ;
+- **corbeille AD :** activée dans la forêt par l'Administrator (un
+  Enterprise Admin), anciens tombstones recyclés, objets supprimés qui
+  gardent leurs attributs, restauration avec les attributs et les liens,
+  restauration sans aucun contrôle par un client qui envoie la simple
+  modification, suppression / restauration / nouvelle suppression,
+  recyclage d'un objet supprimé, restauration refusée pour un objet
+  recyclé et pour un parent absent, liens désactivés masqués sauf
+  demande (sur un domaine provisionné par le test) ; restauration par le
+  code du service ADWS de HardenSamba (samba-adws
+  `tests/dc/test_undelete_request.py`, les trois formes de la requête de
+  restauration) ;
+- **ordre dans ADUC :** les enfants d'une OU reviennent triés par nom
+  d'une recherche LDAP à un niveau, aussi page par page, et un tri
+  explicite décide toujours.
 
 
 Fonctionnement de la phase 2
@@ -490,6 +745,88 @@ domaine racine, arrivée après elle : que `INSTANCE_TYPE_NC_ABOVE` soit
 positionné ou non n'est pas une erreur.
 
 
+
+Fonctionnement de la phase 4
+----------------------------
+
+**Options** (`source4/dsdb/common/util.c`, `python/samba/harden.py`).
+`dsdb_lp_multi_domain_forest()` et `dsdb_multi_domain_forest()` (via
+l'opaque `loadparm` de la ldb) lisent `harden:multi-domain forest` ;
+chaque modification des phases 1 à 3 qui change le comportement d'un DC
+d'une forêt à un seul domaine en dépend (dsdb, réplication, KDC, NTLM,
+LSA, Netlogon, winbindd avec `lp_parm_bool()`, KCC et samba-tool avec
+`samba.harden`). Le code des phases 1 à 3 qui ne sert qu'à un domaine
+enfant (le join SUBDOMAIN, la mise à jour du maître d'infrastructure)
+refuse de se lancer sans elle. Les autres options sont lues là où elles
+servent : `dsdb_harden_recycle_bin()`, `dns_harden_get_options()`,
+l'initialisation du module `onelevel_order`.
+
+**Maître d'infrastructure** (`python/samba/infrastructure.py`). Un GC a
+une réplique partielle de chaque domaine : ses références vers les
+objets des autres domaines sont tenues à jour par leur réplication. Sous
+Windows, le maître d'infrastructure d'un domaine ne doit pas être un GC,
+sauf si tous les DC du domaine en sont (il comparerait ses références à
+ses propres répliques partielles, toujours à jour, et ne trouverait rien
+à mettre à jour pour les autres DC). `run()` s'arrête désormais tout de
+suite sur un GC, et `gc_disabled_reason()` liste les objets nTDSDSA du
+domaine (`msDS-HasDomainNCs`) qui ne sont pas GC (`options` sans
+`NTDSDSA_OPT_IS_GC`). Les liens de syntaxe DN-Binary et DN-String sont
+lus avec `dsdb_dn_guess()`.
+
+**Serveur DNS** (`source4/dns_server/dns_harden.c`, `dns_query.c`,
+`dns_harden_common.c`). Au (re)chargement des zones, celles dont le
+`DSPROPERTY_ZONE_TYPE` est redirecteur (4) ou stub (3) passent dans une
+liste de zones de redirection avec leurs maîtres
+(`DSPROPERTY_ZONE_MASTER_SERVERS_DA`, sinon
+`DSPROPERTY_ZONE_MASTER_SERVERS`), leur délai et leur réglage de
+récursivité (propriétés privées `0xFF01` et `0xFF02`), et les zones de
+`dns_local_zones.ldb` y sont ajoutées. Avant la recherche dans les zones
+faisant autorité, une requête est comparée aux zones de redirection
+(suffixe le plus long, sauf si une zone faisant autorité plus précise
+existe) et redirigée avec le code des redirecteurs globaux, aux maîtres
+d'abord, chacun avec le délai de la zone. Le module `dns_notify` fait
+recharger ses zones au serveur DNS quand une zone d'une partition DNS
+change ; sur un DC enfant, il surveille désormais la partition
+DomainDnsZones de son propre domaine.
+
+**Serveur RPC DNS** (`source4/rpc_server/dnsserver/dnsharden.c`). Les
+partitions du serveur RPC reçoivent la partition legacy
+(`CN=MicrosoftDNS,CN=System,<domaine>`, `DNS_DP_LEGACY`) et le stockage
+local (non intégré à AD). `ZoneCreate` avec un type de zone redirecteur
+ou stub (ou une zone principale avec les options) est traité ici : la
+partition vient des indicateurs `DCPROMO`, de `pszDpFqdn` ou de
+`dwDpFlags`, sinon de `harden:dns default zone partition` ; l'objet de
+zone et ses valeurs `dNSProperty` (type, maîtres en tableaux IP4 et
+DNS_ADDR, délai, récursivité) sont écrits dans une seule transaction.
+`ZoneInfo` prend les maîtres, le délai et la récursivité dans les
+propriétés ; `EnumZones` applique le filtre de la requête par groupes
+(type de zone, intégration à AD, partition) ; `MasterServers`,
+`ResetDwordProperty` et `DeleteZone(FromDs)` sont traités pour ces
+zones, et le serveur DNS est prévenu de recharger ses zones (IRPC
+`dnssrv_reload_dns_zones`).
+
+**Corbeille** (`source4/dsdb/samdb/ldb_modules/`). `rootdse.c` vérifie
+le niveau fonctionnel de la forêt, la portée et le droit
+Manage-Optional-Features (`7c0e2a7c-a419-48e4-a995-10180aad54dd`) de
+l'appelant, écrit `msDS-EnabledFeature` en tant que système et recycle
+les tombstones existants. `util.c` voit la fonctionnalité activée quand
+le conteneur Partitions l'indique. `tombstone_reanimate.c` restaure un
+objet supprimé sans retirer un `isRecycled` qu'il n'a pas et sans
+écraser ses attributs, et refuse les objets recyclés et les parents
+absents. `objectclass.c` transforme la suppression d'un objet supprimé
+en recyclage. `garbage_collect_tombstones.c` recycle les objets
+supprimés après la durée de vie des objets supprimés et efface les
+objets recyclés après celle des tombstones. `extended_dn_out.c` masque
+les liens désactivés.
+
+**Ordre à un niveau** (`source4/dsdb/samdb/ldb_modules/onelevel_order.c`).
+Le module est dans la pile après `server_sort`, sous `paged_results`.
+Pour une recherche à un niveau non fiable (LDAP) sans contrôle de tri ni
+VLV, il garde les entrées, les trie par valeur du RDN
+(`strcasecmp_m()`, puis `strcmp()`) et les envoie avant la réponse de
+fin ; les referrals et les contrôles passent sans changement.
+
+
 Limites connues
 ---------------
 
@@ -550,6 +887,47 @@ Limites connues
   Utilisateurs et ordinateurs Active Directory) face à un domaine enfant
   Samba.
 - `subdom_dc` n'est pas encore dans `script/autobuild.py`.
+- **Options (phase 4) :** elles sont lues au démarrage de samba (le
+  redémarrer après une modification). `harden:multi-domain forest` doit
+  être mise sur tous les DC d'une forêt multi-domaines : un DC sans elle
+  se comporte comme un DC de la branche master et refuse les trusts
+  internes à la forêt. De même pour les options DNS sur les DC qui ont
+  les partitions des redirecteurs conditionnels et des zones de stub, et
+  pour `harden:recycle bin` une fois la corbeille activée (un DC sans
+  elle ne sait pas restaurer un objet supprimé).
+- **Zones de stub :** elles sont résolues en redirigeant les requêtes
+  vers leurs serveurs maîtres. Les enregistrements SOA, NS et glue ne
+  sont pas transférés et rafraîchis comme sous Windows, et la console
+  n'y montre aucun enregistrement.
+- **Console DNS :** le changement de type d'une zone (`ZoneTypeReset`)
+  ou de son étendue de réplication (`ZoneChangeDirectoryPartition`)
+  n'est pas implémenté (supprimer la zone et la recréer), et
+  `EnumDirectoryPartitions` ne liste toujours que DomainDnsZones et
+  ForestDnsZones. Les serveurs maîtres IPv6 ne sont montrés qu'aux
+  clients qui utilisent les tableaux `DNS_ADDR` (version LONGHORN, la
+  console des versions actuelles de Windows). Les indicateurs envoyés
+  par la console (partition, filtres d'`EnumZones`) ont été repris de
+  [MS-DNSP] et de `dnscmd`, pas de captures de la console, qui n'a pas
+  encore été testée.
+- **Stockage DNS :** le délai et le réglage « ne pas utiliser la
+  récursivité » d'un redirecteur conditionnel stocké dans AD utilisent
+  deux identifiants `dNSProperty` privés (`0xFF01`, `0xFF02`) ; leur
+  traitement par un DC Windows n'a pas été testé. Les zones stockées sur
+  un seul DC demandent un administrateur du domaine. BIND9 DLZ ne
+  connaît pas les redirecteurs conditionnels ni les zones de stub.
+- **Corbeille :** les liens désactivés sont masqués dans les résultats
+  des recherches LDAP, mais un filtre de recherche sur un attribut lié
+  les trouve encore, et la réplication des liens désactivés n'a pas été
+  comparée à Windows. La restauration depuis le Centre d'administration
+  Active Directory demande le service ADWS de HardenSamba (branche
+  `fix/restore-deleted-objects`) ; la forme de la requête de restauration
+  envoyée par la console est une déduction (le service accepte les trois
+  formes possibles).
+- **Ordre des recherches à un niveau :** seules les recherches LDAP à un
+  niveau sans contrôle de tri ni VLV sont triées, par valeur du RDN, avec
+  la comparaison sans casse de Samba (`strcasecmp_m()`) : l'ordre des
+  noms accentués peut différer de celui de Windows. Les entrées de la
+  recherche sont gardées en mémoire jusqu'au tri.
 
 
 Annonce d'Active Directory Web Services (ADWS)
@@ -697,6 +1075,35 @@ Modifications en détail
 | 45 | `python:dbcheck: NC_ABOVE below a partial replica is fine` | `python/samba/dbchecker.py` | Sur un GC d'un domaine enfant, la tête du NC de son domaine est sous la réplique partielle du domaine racine, arrivée après elle : `INSTANCE_TYPE_NC_ABOVE` positionné ou non n'est pas une erreur. |
 | 46 | `selftest: test the phase 3 multi-domain features` | `python/samba/tests/subdomain.py` | 8 nouveaux tests dans `samba.tests.subdomain`, voir [Tests](#tests). |
 
+
+### Phase 4
+
+| # | Commit | Fichiers | Quoi et pourquoi |
+|---|--------|----------|------------------|
+| 47 | `s4:dsdb: make the multi-domain forest support an option` | `source4/dsdb/common/util.c`, `util_groups.c`, `source4/dsdb/repl/drepl_periodic.c`, `drepl_service.c`, `source4/dsdb/samdb/ldb_modules/descriptor.c`, `extended_dn_out.c`, `partition_init.c`, `repl_meta_data.c`, `samldb.c`, `selftest/target/Samba4.pm` | Nouvelles `dsdb_lp_multi_domain_forest()` et `dsdb_multi_domain_forest()` (`harden:multi-domain forest`, désactivée par défaut). Sans l'option, le code dsdb des phases 1 à 3 se comporte comme sur la branche master (DSA d'un autre domaine, tête de NC d'une réplique partielle, liens vers des NC non détenus, SID de la racine dans les descripteurs, carte LMDB des partitions créées à chaud, backlinks en attente, contrôles d'étendue de groupe et du maître des noms, groupes des jetons, rechargement des partitions). Les DC de la forêt de `ad_dc_ntvfs` reçoivent l'option en selftest. |
+| 48 | `s4: WITHIN_FOREST trusts only with "harden:multi-domain forest"` | `source4/kdc/db-glue.c`, `pac-glue.c`, `source4/auth/ntlm/auth_sam.c`, `auth_winbind.c`, `source4/rpc_server/lsa/dcesrv_lsa.c`, `lsa_lookup.c`, `source4/rpc_server/netlogon/dcerpc_netlogon.c` | Sans l'option : pas de clés inter-royaumes ni de referrals pour un trust `WITHIN_FOREST` dans le KDC, pas de filtrage de SID interne à la forêt, pas de relais NTLM vers les domaines de la forêt, `CreateTrustedDomain*` refuse `WITHIN_FOREST`, la vue BUILTIN traite les UPN, et Netlogon décrit le domaine comme sur master. |
+| 49 | `s3:winbindd: the domains of the forest only with "harden:multi-domain forest"` | `source3/winbindd/winbindd_util.c`, `winbindd_msrpc.c` | Sans l'option, les trusts `WITHIN_FOREST` sont ignorés, les espaces de noms routés comme sur master et `LsapLookupGC` n'est pas utilisé. |
+| 50 | `python: join and replicate a child domain only with "harden:multi-domain forest"` | `python/samba/harden.py` (nouveau), `python/samba/kcc/__init__.py`, `kcc_utils.py`, `python/samba/netcmd/domain/join.py`, `python/samba/tests/kcc/__init__.py` | `samba.harden` (noms des options, `lp_bool()`, `multi_domain_forest()`). Le join SUBDOMAIN demande l'option ; sans elle, le KCC fonctionne comme sur master. |
+| 51 | `python:infrastructure: the role does nothing on a global catalog` | `python/samba/infrastructure.py`, `python/samba/netcmd/domain/infrastructure.py`, `python/samba/kcc/__init__.py`, `docs-xml/manpages/samba-tool.8.xml`, `python/samba/tests/subdomain.py` | Comme sous Windows, la mise à jour du maître d'infrastructure ne fait rien sur un GC et indique quels DC du domaine pourraient tenir le rôle ; `samba-tool domain infrastructure-update` demande l'option multi-domaines ; les liens DN-Binary et DN-String (`msDS-RevealedUsers` d'un RODC) ne la font plus échouer. Nouveau `test_infrastructure_master_on_gc`. |
+| 52 | `s4:dsdb: add the onelevel_order module ("harden:sort one-level results")` | `source4/dsdb/samdb/ldb_modules/onelevel_order.c` (nouveau), `wscript_build_server`, `samba_dsdb.c` | Trie par nom les entrées des recherches LDAP à un niveau sans contrôle de tri ni VLV, pour qu'Utilisateurs et ordinateurs Active Directory affiche les objets par ordre alphabétique. |
+| 53 | `s4:dsdb: enable the AD Recycle Bin for the forest ("harden:recycle bin")` | `source4/dsdb/common/util.c`, `source4/dsdb/samdb/ldb_modules/util.c`, `rootdse.c` | La corbeille est activée quand le conteneur Partitions l'indique ; `enableOptionalFeature` vérifie le niveau fonctionnel de la forêt, la portée et le droit Manage-Optional-Features de l'appelant, écrit `msDS-EnabledFeature` en tant que système et recycle les tombstones existants. Nouvelles `dsdb_harden_recycle_bin()`, `dsdb_deleted_object_lifetime()`, `dsdb_check_optional_feature_forest()`. |
+| 54 | `s4:dsdb: delete, restore and recycle objects as Windows does` | `source4/dsdb/samdb/ldb_modules/objectclass.c`, `tombstone_reanimate.c`, `repl_meta_data.c`, `show_deleted.c`, `extended_dn_out.c`, `source4/dsdb/kcc/garbage_collect_tombstones.c`, `python/samba/tests/recycle_bin.py` (nouveau), `selftest/tests.py` | Restauration sans `noSuchAttribute` et avec les attributs, refusée pour les objets recyclés et les parents absents ; la suppression d'un objet supprimé le recycle ; recyclage après la durée de vie des objets supprimés ; liens désactivés masqués sauf demande ; `msDS-LastKnownRDN` remplacé. 9 tests. |
+| 55 | `librpc:dnsp: private dnsProperty ids for the conditional forwarders` | `librpc/idl/dnsp.idl`, `source4/dns_server/dnsserver_common.c` | `DSPROPERTY_ZONE_SAMBA_FORWARDER_TIMEOUT` (`0xFF01`) et `DSPROPERTY_ZONE_SAMBA_FORWARDER_SLAVE` (`0xFF02`), que [MS-DNSP] ne définit pas. |
+| 56 | `s4:dns_server: resolve the conditional forwarders and stub zones` | `source4/dns_server/dns_harden.c` (nouveau), `dns_harden_common.c` (nouveau), `dns_harden_common.h` (nouveau), `dns_server.c`, `dns_server.h`, `dns_query.c`, `dnsserver_common.h`, `wscript_build` | `harden:dns conditional forwarders`, `harden:dns stub zones` : les zones redirecteur et stub (AD et stockage local) sont redirigées vers leurs maîtres, puis vers les redirecteurs globaux pour un redirecteur conditionnel qui autorise la récursivité. |
+| 57 | `s4:rpc_server:dnsserver: conditional forwarders, stub zones and the legacy partition` | `source4/rpc_server/dnsserver/dnsharden.c` (nouveau), `dcerpc_dnsserver.c`, `dnsdb.c`, `dnsserver.h`, `source4/rpc_server/wscript_build` | Création, description, liste, modification et suppression des redirecteurs conditionnels et des zones de stub depuis la console DNS, dans la partition de forêt, de domaine ou legacy, ou sur le DC seulement ; `harden:dns default zone partition`. |
+| 58 | `s4:dsdb:dns_notify: watch the DomainDnsZones of the domain of a child DC` | `source4/dsdb/samdb/ldb_modules/dns_notify.c` | Le serveur DNS d'un DC enfant ne rechargeait pas ses zones quand une zone de son propre DomainDnsZones changeait (celui de la racine était surveillé). |
+| 59 | `samba-tool dns: conditional forwarders, stub zones and the zone partitions` | `python/samba/netcmd/dns.py` | `zonecreate --type --master --forwarder-timeout --no-recursion --not-ds-integrated`, `--dns-directory-partition=legacy` et sa valeur par défaut dans `smb.conf` ; `zonelist --forwarder --stub`. |
+| 60 | `selftest: test the phase 4 DNS and one-level options on subdom_dc` | `selftest/target/Samba4.pm`, `python/samba/tests/dns_harden.py` (nouveau), `python/samba/tests/onelevel_order.py` (nouveau), `source4/selftest/tests.py` | Les options DNS et de tri sur `subdom_dc`, `samba.tests.dns_harden` (6 tests) et `samba.tests.onelevel_order` (3 tests). |
+
+samba-adws, branche `fix/restore-deleted-objects` (au-dessus de
+`fix/get-forwards-visibility-controls`), commit `e4d2182`
+(`Restore deleted objects in one undelete modify; enable optional features through the rootDSE`) :
+un `Put` qui retire `isDeleted` devient la modification unique de
+restauration (`classes/directory/undelete_request.py`), et
+`ChangeOptionalFeature` passe par l'opération `enableOptionalFeature`
+du rootDSE au lieu d'écrire `msDS-EnabledFeature`, réservé au système ;
+tests et documentation mis à jour.
+
 Tests
 -----
 
@@ -705,7 +1112,8 @@ Compiler avec le selftest activé, puis lancer les tests multi-domaines :
 ```
 ./configure --enable-selftest --enable-debug
 make -j$(nproc)
-make test TESTS="samba.tests.subdomain"
+make test TESTS="samba.tests.subdomain samba.tests.dns_harden \
+    samba.tests.onelevel_order samba.tests.recycle_bin"
 ```
 
 Pour obtenir un shell dans l'environnement de test :
@@ -714,9 +1122,9 @@ Pour obtenir un shell dans l'environnement de test :
 SELFTEST_TESTENV=subdom_dc make testenv
 ```
 
-`samba.tests.subdomain` (`python/samba/tests/subdomain.py`) compte 22
+`samba.tests.subdomain` (`python/samba/tests/subdomain.py`) compte 23
 tests : les 6 de la phase 1 (état laissé par le join sur les deux DC),
-8 pour la phase 2 et 8 pour la phase 3.
+8 pour la phase 2, 8 pour la phase 3 et 1 pour la phase 4.
 
 Phase 2 :
 
@@ -791,6 +1199,54 @@ Résultats sur cette branche (phase 3) :
   complète de Samba n'a pas été lancée.
 
 
+Phase 4 :
+
+| Test | Vérifie |
+|------|---------|
+| `samba.tests.subdomain` : `test_infrastructure_master_on_gc` | sur le DC parent (un GC), la mise à jour du maître d'infrastructure ne fait rien et l'indique dans le journal, en nommant les DC qui ne sont pas GC s'il y en a |
+| `samba.tests.dns_harden` (`subdom_dc`) : `test_default_partition` | une zone créée sans partition va dans ForestDnsZones (`harden:dns default zone partition = forest`) |
+| `test_legacy_partition` | une zone créée avec `DNS_DP_LEGACY` est dans `CN=MicrosoftDNS,CN=System` de la partition de domaine, et `EnumZones` la liste avec le filtre legacy, pas avec celui de la forêt |
+| `test_conditional_forwarder` | un redirecteur conditionnel dans DomainDnsZones, avec le DC parent comme maître : dans la liste des redirecteurs et pas dans celle des zones principales, `ZoneInfo` (type, délai 7, récursivité, maîtres), un nom de la zone du parent résolu par le DC enfant, `ResetDwordProperty ForwarderSlave`, `MasterServers` avec un maître IPv6, enregistrements refusés, suppression |
+| `test_local_conditional_forwarder` | un redirecteur conditionnel hors AD : aucun objet dans l'annuaire, listé avec le filtre `NON_DS`, `fUseDatabase` à 0, résolu, supprimé avec `DeleteZone` |
+| `test_stub_zone` | une zone de stub dans ForestDnsZones : dans la liste des zones de stub, de type stub, résolue par son maître |
+| `test_disabled_on_parent` | le DC parent, sans les options, refuse un redirecteur conditionnel (`WERR_CALL_NOT_IMPLEMENTED`), comme la branche master |
+| `samba.tests.onelevel_order` (`subdom_dc`) | les enfants d'une OU (OU et contacts aux noms en casse mélangée, créés dans un ordre aléatoire) reviennent triés par nom, aussi à travers les pages d'une recherche paginée (pages de 7), et un `server_sort` explicite (inverse) décide toujours |
+| `samba.tests.recycle_bin` (sans environnement) | sur un domaine provisionné par le test avec `harden:recycle bin` : activation par l'Administrator, ancien tombstone recyclé, utilisateur supprimé qui garde ses attributs et est restauré avec eux (avec et sans contrôle côté client), suppression / restauration / nouvelle suppression, objet supprimé recyclé par une suppression et plus restaurable, parent absent refusé (`2089`), liens désactivés |
+
+Résultats sur cette branche (phase 4) :
+
+- `samba.tests.subdomain` : 23/23 OK ; `samba.tests.dns_harden` : 6/6 OK ;
+  `samba.tests.onelevel_order` : 3/3 OK ; `samba.tests.recycle_bin` :
+  9/9 OK ; `samba.tests.kcc` sur `vampire_dc` et `promoted_dc`,
+  `samba.tests.kcc.graph`, `.graph_utils`, `.ldif_import_export`,
+  `.kcc_utils` : ALL OK.
+- DNS, avec les options sur `subdom_dc` seulement : `samba.tests.dns`
+  sur `fl2003dc`, `rodc` et `vampire_dc`, `samba.tests.dns_aging`,
+  `samba.tests.dns_forwarder` (`fl2003dc`), `samba.tests.dns_tkey`
+  (`fl2008r2dc`), `samba.tests.dns_wildcard`, `.dns_invalid`,
+  `.dns_packet` (`ad_dc`), `samba.tests.dcerpc.dnsserver`
+  (`ad_dc_ntvfs`, `ad_dc`), `samba.tests.samba_tool.dnscmd`
+  (`chgdcpass`) : ALL OK.
+- Options désactivées (le domaine de `ad_dc` et les environnements
+  `fl*` n'en activent aucune ; `ad_dc_ntvfs` n'active que
+  `harden:multi-domain forest`) : `samba4.tombstone_reanimation.python`,
+  `samba4.ldap.vlv.python` (`ad_dc_slowtests`),
+  `samba4.ldap.dirsync.python`, `samba4.ldap.linked_attributes.python`
+  (`ad_dc`), `samba4.ldap.sort.python`, `samba4.deletetest.python`,
+  `samba.tests.dsdb`, `samba.tests.dcerpc.lsa` (`ad_dc_default`),
+  `samba4.blackbox.trust_ntlm` (`fl2008r2dc`, `fl2003dc`, `fl2000dc`,
+  `ad_member`, `nt4_member`), `samba.tests.samba_tool.help`,
+  `samba.tests.source`, `samba.tests.source_chars` : ALL OK (419 tests).
+- samba-adws : `tests/dc/test_undelete_request.py` 5/5 OK (sur un domaine
+  provisionné avec cette branche, options désactivées), la suite de
+  niveau 0 295/295 OK, `tools/norms`, ruff, flake8 et `mypy --strict`
+  sans remarque sur les fichiers modifiés.
+- Non testé : la console DNS de Windows, le Centre d'administration
+  Active Directory et Utilisateurs et ordinateurs Active Directory face à
+  ces fonctionnalités (pas de client Windows dans cet environnement), et
+  la suite de tests complète de Samba.
+
+
 Feuille de route
 ----------------
 
@@ -800,6 +1256,14 @@ d'infrastructure, maître d'attribution des noms de domaine, catalogue
 global d'un domaine enfant, ForestDnsZones sur les DC enfants,
 `parent_index` et drapeaux de la forêt dans Netlogon, filtrage de SID
 dans la forêt, backlink manquant et vérification du KCC.
+
+Fait en phase 4 : chaque fonctionnalité derrière une option de
+`smb.conf`, rôle de maître d'infrastructure désactivé sur un GC,
+redirecteurs conditionnels et zones de stub (dans AD, avec les trois
+étendues de réplication, ou locaux), partition par défaut d'une nouvelle
+zone DNS, corbeille AD et restauration depuis le Centre d'administration
+Active Directory (avec samba-adws), ordre des objets dans Utilisateurs
+et ordinateurs Active Directory.
 
 1. **Références sans GC :** phantoms (ou équivalent) pour que n'importe
    quel DC puisse stocker un membre d'un autre domaine ; recherche des
@@ -817,7 +1281,12 @@ dans la forêt, backlink manquant et vérification du KCC.
    maître d'attribution des noms une fois son dernier DC parti).
 4. **Interopérabilité :** domaine enfant Samba sous une racine Windows et
    l'inverse, outils d'administration Windows face à un domaine enfant
-   Samba ; `subdom_dc` dans autobuild.
+   Samba ; `subdom_dc` dans autobuild ; captures de la console DNS, du
+   Centre d'administration Active Directory et d'Utilisateurs et
+   ordinateurs Active Directory face aux fonctionnalités de la phase 4.
+5. **DNS :** transferts de zone pour les zones de stub, changement du
+   type et de l'étendue de réplication d'une zone, partition legacy dans
+   `EnumDirectoryPartitions`, BIND9 DLZ.
 
 
 Soumission upstream

@@ -18,12 +18,20 @@ original Samba README follows below, after the "About Samba" heading.
 > of the child domain (which now holds the forest root domain), the
 > forest partitions on the child DC, the Infrastructure Master and the
 > Domain Naming Master roles, the forest view of Netlogon and the SID
-> filtering inside the forest. Several things are still missing, see
+> filtering inside the forest. Phase 4 makes every feature an option of
+> `smb.conf`, off by default (with none of them set, the DC behaves as a
+> DC of the Samba master branch), disables the Infrastructure Master
+> role on a global catalog as Windows does, and adds conditional
+> forwarders and stub zones to the internal DNS server, the choice of the
+> partition of a new DNS zone, the AD Recycle Bin as Windows handles it
+> and the alphabetical order of the objects in Active Directory Users
+> and Computers. Several things are still missing, see
 > [Known limitations](#known-limitations).
 
 - Base: Samba `master` at commit `f6fddd2232c9` (4.26.0pre1, 2026-10-30)
-- Branch: `_Harden-Box-Multi-domains-supports-phase3`, on top of
-  `_Harden-Box-Multi-domains-supports-phase2` (itself on top of
+- Branch: `_Harden-Box-Multi-domains-supports-phase4`, on top of
+  `_Harden-Box-Multi-domains-supports-phase3` (itself on top of
+  `_Harden-Box-Multi-domains-supports-phase2` and
   `_Harden-Box-Multi-domains-supports-phase1`)
 - Phase 1: 11 code commits for the multi-domain work, 1 commit that
   makes the DC advertise Active Directory Web Services (see
@@ -31,7 +39,11 @@ original Samba README follows below, after the "About Samba" heading.
   and its documentation
 - Phase 2: 15 code commits (numbered 13 to 27 in
   [Changes in detail](#changes-in-detail)) and their documentation
-- Phase 3: 19 code commits (numbered 28 to 46) and this documentation
+- Phase 3: 19 code commits (numbered 28 to 46) and their documentation
+- Phase 4: 14 code commits (numbered 47 to 60) and this documentation;
+  the restore of deleted objects from the Active Directory
+  Administrative Center also needs the samba-adws branch
+  `fix/restore-deleted-objects` (see [AD Recycle Bin](#ad-recycle-bin))
 
 
 Context
@@ -56,12 +68,58 @@ yet" (KDC, winbindd), "TODO: handle multiple domains in a forest"
   forest root groups their place in the child domain, lets the DCs of
   the two domains replicate, and lets a global catalog hold the other
   domain.
-- **Phase 3** (this branch) handles the references between the domains
-  (members of a group from another domain, backlinks, universal groups
-  in the tokens, Infrastructure Master), completes the global catalog of
-  a child domain and the forest partitions of its DC, implements the
-  Domain Naming Master checks, and reviews Netlogon and the SID
-  filtering for the domains of the forest.
+- **Phase 3** handles the references between the domains (members of a
+  group from another domain, backlinks, universal groups in the tokens,
+  Infrastructure Master), completes the global catalog of a child domain
+  and the forest partitions of its DC, implements the Domain Naming
+  Master checks, and reviews Netlogon and the SID filtering for the
+  domains of the forest.
+- **Phase 4** (this branch) makes every feature an option of `smb.conf`
+  (see [Configuration](#configuration)), disables the Infrastructure
+  Master role on a global catalog, and adds features that are not
+  specific to multi-domain forests: conditional forwarders and stub
+  zones in the internal DNS server, managed from the DNS console of a
+  Windows machine, the partition of a new DNS zone, the AD Recycle Bin,
+  and the order of the objects in Active Directory Users and Computers.
+
+
+Configuration
+-------------
+
+Every feature of the Harden-Box branches is enabled by a parametric
+option of the `[global]` section of `smb.conf`, **off by default**. With
+none of them set, the DC behaves as a DC of the Samba master branch: each
+commit of phase 4 says what its option changes, and the
+[Testing](#testing) section lists the regression suites run with the
+options off.
+
+| Option | Default | Enables |
+|---|---|---|
+| `harden:multi-domain forest` | `no` | the multi-domain forest support of phases 1 to 3: child domains, `WITHIN_FOREST` trusts in the KDC, winbindd, NTLM, LSA and Netlogon, partial replicas of the other domains on the global catalogs, members from another domain, infrastructure master update... Set it on **every DC of the forest**, those of the forest root domain included. |
+| `harden:recycle bin` | `no` | the AD Recycle Bin as Windows handles it, once the forest has it enabled, see [AD Recycle Bin](#ad-recycle-bin) |
+| `harden:sort one-level results` | `no` | the one-level LDAP searches sorted by name, see [Order of the objects in ADUC](#order-of-the-objects-in-aduc) |
+| `harden:dns conditional forwarders` | `no` | the conditional forwarders of the internal DNS server, see [DNS](#dns-conditional-forwarders-stub-zones-and-zone-partitions) |
+| `harden:dns stub zones` | `no` | the stub zones of the internal DNS server |
+| `harden:dns default zone partition` | unset | the partition of a new DNS zone when the client names none: `domain` (DomainDnsZones, as on the master branch), `forest` (ForestDnsZones) or `legacy` (`CN=MicrosoftDNS,CN=System` of the domain partition); any value also lets the DNS RPC server handle the legacy partition |
+| `adws:advertise` | `no` | the ADWS flag of the netlogon response (phase 1), see [ADWS advertisement](#active-directory-web-services-adws-advertisement) |
+| `kcc:infrastructure update interval` | `3600` | seconds between two runs of the infrastructure master update by the KCC (phase 3) |
+
+For example, on a DC of a multi-domain forest that uses all of them:
+
+```ini
+[global]
+    harden:multi-domain forest = yes
+    harden:recycle bin = yes
+    harden:sort one-level results = yes
+    harden:dns conditional forwarders = yes
+    harden:dns stub zones = yes
+    harden:dns default zone partition = forest
+```
+
+Restart samba after a change. They are generic (parametric) options:
+`testparm` shows them as they are written, and they need no change in
+the parameter tables. The DNS options are for the internal DNS server
+(`--dns-backend=SAMBA_INTERNAL`), not for BIND9 DLZ.
 
 
 Usage
@@ -74,6 +132,7 @@ samba-tool domain join child.example.com SUBDOMAIN \
     --parent-domain=example.com \
     --server=dc1.example.com \
     --option="workgroup=CHILD" \
+    --option="harden:multi-domain forest=yes" \
     -UAdministrator@EXAMPLE.COM \
     --adminpass='<password of the Administrator of the new domain>'
 ```
@@ -86,9 +145,13 @@ samba-tool domain join child.example.com SUBDOMAIN \
   (the crossRef of the new domain is created on the Domain Naming Master).
 - Without `--adminpass`, the Administrator password of the new domain is
   random.
-- The DCs of the parent domain must run this branch too: the KDC,
-  winbindd, LSA, the replication and the KCC changes are needed on both
-  sides.
+- The DCs of the parent domain must run this branch too, with
+  `harden:multi-domain forest = yes` in their `smb.conf` (restart them
+  after adding it): the KDC, winbindd, LSA, the replication and the KCC
+  changes are needed on both sides.
+- The join refuses to run without `harden:multi-domain forest = yes`
+  (phase 4). Given with `--option` (no space around `=`), it is written
+  to the `smb.conf` of the new DC.
 
 What the join does:
 
@@ -139,10 +202,157 @@ samba-tool domain infrastructure-update -H /var/lib/samba/private/sam.ldb \
     [--gc=ldap://<global catalog>:3268] [--dry-run] [--force]
 ```
 
-`--gc` is only needed on a DC that is not a global catalog and can't find
-one by itself; `--force` runs it on a DC that is not the Infrastructure
-Master. The interval of the KCC run is set by
+`--gc` is only needed when the DC can't find a global catalog by
+itself; `--force` runs it on a DC that is not the Infrastructure Master.
+The interval of the KCC run is set by
 `kcc:infrastructure update interval = <seconds>` in `smb.conf`.
+
+As on Windows, the Infrastructure Master role does nothing on a DC that
+is a global catalog (phase 4): the KCC and `samba-tool domain
+infrastructure-update` log why and stop. When some DCs of the domain are
+not global catalogs, the log names them and asks to move the role to one
+of them (`samba-tool fsmo transfer --role=infrastructure` on that DC);
+when every DC of the domain is a global catalog, the role is not needed.
+
+
+DNS: conditional forwarders, stub zones and zone partitions
+-----------------------------------------------------------
+
+With `harden:dns conditional forwarders = yes` and
+`harden:dns stub zones = yes` (internal DNS server), the DNS console of a
+Windows machine (`dnsmgmt.msc`, connected to the DC) creates, modifies
+and deletes:
+
+- **conditional forwarders** (*Conditional Forwarders > New Conditional
+  Forwarder...*): the DNS domain, the IP addresses of its master servers,
+  the timeout of the forwarded queries, and *Store this conditional
+  forwarder in Active Directory, and replicate it as follows*;
+- **stub zones** (*New Zone... > Stub zone*): the zone, its master
+  servers, and whether and where it is stored in Active Directory.
+
+Stored in Active Directory, they replicate to every DC that holds their
+partition, like the primary zones:
+
+| Console choice | Partition |
+|---|---|
+| All DNS servers running on domain controllers in this forest | ForestDnsZones |
+| All DNS servers running on domain controllers in this domain | DomainDnsZones of the domain |
+| All domain controllers in this domain (for Windows 2000 compatibility) | `CN=MicrosoftDNS,CN=System` of the domain partition (the "legacy" partition) |
+
+Not stored in Active Directory, they only exist on the DC that created
+them (in `dns_local_zones.ldb`, in the state directory; on Windows, a
+file in `%windir%\System32\dns`); only an administrator creates,
+changes or deletes them.
+
+The DNS server sends a query for a name of a conditional forwarder to
+its master servers, then, unless the forwarder says not to use
+recursion, to the global forwarders (`dns forwarder`); a query for a
+name of a stub zone goes to its master servers only. A more specific
+zone of the DC wins.
+
+The same from `samba-tool`:
+
+```
+samba-tool dns zonecreate dc1 example.org --type=forwarder \
+    --master=192.0.2.53 --master=2001:db8::53 --forwarder-timeout=3 \
+    --dns-directory-partition=forest -UAdministrator
+samba-tool dns zonecreate dc1 partner.test --type=stub \
+    --master=192.0.2.10 --dns-directory-partition=legacy -UAdministrator
+samba-tool dns zonecreate dc1 lab.test --type=forwarder \
+    --master=192.0.2.99 --not-ds-integrated -UAdministrator
+samba-tool dns zonelist dc1 --forwarder -UAdministrator
+samba-tool dns zonedelete dc1 example.org -UAdministrator
+```
+
+**Partition of a new zone.** With
+`harden:dns default zone partition = domain|forest|legacy`, a zone
+created without a partition (`samba-tool dns zonecreate` without
+`--dns-directory-partition`, `dnscmd /ZoneAdd ... /DsPrimary` without
+`/DP`) goes to that partition, primary zones included. Without the
+option it goes to DomainDnsZones, as on the master branch.
+
+Set the DNS options on **every DC that holds the partition** of these
+zones (every DC of the forest for ForestDnsZones): a DC without them
+loads a conditional forwarder or a stub zone as an empty primary zone,
+and answers that its names do not exist.
+
+
+AD Recycle Bin
+--------------
+
+The Recycle Bin is an optional feature of the forest. Samba already had
+most of it, but a DC only saw it enabled when its own nTDSDSA object
+listed it, the restore of a deleted object failed once it was enabled
+(`noSuchAttribute`), and an administrator could not enable it. With
+`harden:recycle bin = yes`, set on every DC of the forest, a DC behaves
+as a Windows DC ([MS-ADTS] 3.1.1.5.5, 3.1.1.5.3.7 and 3.1.1.9.1).
+
+**Enabling it** (forest functional level 2008 R2 or higher, by an
+Enterprise Admin; it can't be disabled). From a Windows machine with
+the HardenSamba ADWS service (samba-adws branch
+`fix/restore-deleted-objects`): the *Enable Recycle Bin...* action of
+the Active Directory Administrative Center, or
+
+```
+Enable-ADOptionalFeature 'Recycle Bin Feature' -Scope ForestOrConfigurationSet -Target example.com
+```
+
+Or on a DC, as root:
+
+```
+ldbmodify -H /var/lib/samba/private/sam.ldb <<'END'
+dn:
+changetype: modify
+add: enableOptionalFeature
+enableOptionalFeature: CN=Partitions,CN=Configuration,DC=example,DC=com:766ddcd8-acd0-445e-f3b9-a7f9b6744f2a
+END
+```
+
+Once enabled:
+
+| State | `isDeleted` | `isRecycled` | Attributes and links | Restore |
+|---|---|---|---|---|
+| deleted object (for `msDS-DeletedObjectLifetime`, else the tombstone lifetime) | `TRUE` | absent | kept; the links are deactivated (hidden without the `LDAP_SERVER_SHOW_DEACTIVATED_LINK` control) | yes, with its attributes and links |
+| recycled object (removed after the tombstone lifetime) | `TRUE` | `TRUE` | removed, as for a tombstone | no (`unwillingToPerform`) |
+| tombstone made before the Recycle Bin was enabled | `TRUE` | `TRUE` (set when the feature is enabled) | removed | no |
+
+Deleting a deleted object (emptying the Recycle Bin) makes it a recycled
+object. A restore is one modify of the deleted object, as on Windows:
+`isDeleted` removed and `distinguishedName` replaced, with the
+`show_deleted` control:
+
+```
+ldbmodify -H ldap://dc1 -UAdministrator --controls=show_deleted:1 <<'END'
+dn: <GUID=5e3ea2a3-0b5c-4c4f-a3a6-7b0e0a29a6b2>
+changetype: modify
+delete: isDeleted
+-
+replace: distinguishedName
+distinguishedName: CN=Jane Doe,OU=Staff,DC=example,DC=com
+END
+```
+
+The new parent must exist (`noSuchObject`, `ERROR_DS_NO_PARENT_OBJECT`
+otherwise: restore the deleted parent first). `Restore-ADObject` and the
+*Restore* / *Restore To...* actions of the Active Directory
+Administrative Center work through the HardenSamba ADWS service, branch
+`fix/restore-deleted-objects`, which turns them into that modify (the
+Administrative Center lists the deleted objects since the branch
+`fix/get-forwards-visibility-controls`).
+
+
+Order of the objects in ADUC
+----------------------------
+
+Active Directory Users and Computers shows the objects of a container
+in the order the DC returns them. A Windows DC answers a one-level
+search through its index on the parent and the name, so the objects
+come back in alphabetical order; Samba returned them in the order of
+its own index (by GUID). With `harden:sort one-level results = yes`,
+the one-level searches that come from LDAP and don't ask for an order
+themselves (server side sort, VLV) are sorted by name
+(case-insensitive), the pages of a paged search included. The order of
+Windows is a deduction from its behaviour, not from a specification.
 
 
 What works
@@ -238,6 +448,39 @@ Phase 3:
   infrastructure-update`;
 - **KCC:** `samba.tests.kcc` passes on `promoted_dc` and `vampire_dc`
   with a child domain in the forest.
+
+Phase 4:
+
+- **options:** with none of the `harden:` options, the DC behaves as on
+  the master branch (the regression suites listed in
+  [Testing](#testing) pass on the selftest environments that don't set
+  them); `samba-tool domain join ... SUBDOMAIN` refuses to run without
+  `harden:multi-domain forest`;
+- **Infrastructure Master on a GC:** the role does nothing on a global
+  catalog, and says which DCs of the domain could hold it;
+- **DNS** (child DC, internal DNS server): a conditional forwarder
+  created in DomainDnsZones with a master on the parent DC resolves the
+  names of the parent zone through it, is listed and described as a
+  forwarder (masters with IPv6, timeout, recursion), refuses records,
+  is modified (masters, timeout, recursion) and deleted; the same for a
+  conditional forwarder stored on the DC only and for a stub zone in
+  ForestDnsZones; a zone created without a partition goes to the
+  partition of `harden:dns default zone partition`, and a zone can be
+  created in the legacy partition; the parent DC, without the options,
+  refuses conditional forwarders and stub zones;
+- **AD Recycle Bin:** enabled in the forest by the Administrator (an
+  Enterprise Admin), old tombstones recycled, deleted objects that keep
+  their attributes, restore with the attributes and links, restore
+  without any control from the client side code that sends the plain
+  modify, delete / restore / delete again, recycling a deleted object,
+  restore refused for a recycled object and for a missing parent,
+  deactivated links hidden unless asked for (on a domain provisioned
+  by the test); restore through the HardenSamba ADWS service code
+  (samba-adws `tests/dc/test_undelete_request.py`, three forms of the
+  restore request);
+- **ADUC order:** the children of an OU come back sorted by name from a
+  one-level LDAP search, also page by page, and an explicit sort still
+  decides.
 
 
 How phase 2 works
@@ -459,6 +702,83 @@ root domain, which arrived after it: whether `INSTANCE_TYPE_NC_ABOVE` is
 set or not is not an error.
 
 
+
+How phase 4 works
+-----------------
+
+**Options** (`source4/dsdb/common/util.c`, `python/samba/harden.py`).
+`dsdb_lp_multi_domain_forest()` and `dsdb_multi_domain_forest()` (from
+the `loadparm` opaque of the ldb) read `harden:multi-domain forest`;
+every change of phases 1 to 3 that alters the behaviour of a DC of a
+single-domain forest is behind them (dsdb, replication, KDC, NTLM, LSA,
+Netlogon, winbindd with `lp_parm_bool()`, KCC and samba-tool with
+`samba.harden`). The code of phases 1 to 3 that only runs for a child
+domain (the SUBDOMAIN join, the infrastructure master update) refuses
+to run without it. The other options are read where they are used:
+`dsdb_harden_recycle_bin()`, `dns_harden_get_options()`, the init of
+the `onelevel_order` module.
+
+**Infrastructure Master** (`python/samba/infrastructure.py`). A GC holds
+a partial replica of every domain: its references to the objects of the
+other domains are kept up to date by their replication. On Windows, the
+infrastructure master of a domain must not be a GC unless every DC of
+the domain is one (it would compare its references with its own, always
+up to date, partial replicas and find nothing to update for the other
+DCs). `run()` now returns at once on a GC, and `gc_disabled_reason()`
+lists the nTDSDSA objects of the domain (`msDS-HasDomainNCs`) that are
+not GCs (`options` without `NTDSDSA_OPT_IS_GC`). The links of the
+DN-Binary and DN-String syntaxes are parsed with `dsdb_dn_guess()`.
+
+**DNS server** (`source4/dns_server/dns_harden.c`, `dns_query.c`,
+`dns_harden_common.c`). When the zones are (re)loaded, those whose
+`DSPROPERTY_ZONE_TYPE` is forwarder (4) or stub (3) are moved to a list
+of forward zones with their masters (`DSPROPERTY_ZONE_MASTER_SERVERS_DA`,
+else `DSPROPERTY_ZONE_MASTER_SERVERS`), timeout and recursion setting
+(private properties `0xFF01` and `0xFF02`), and the zones of
+`dns_local_zones.ldb` are added. Before the authoritative lookup, a
+query is matched against the forward zones (longest suffix, unless a
+more specific authoritative zone exists) and forwarded with the code of
+the global forwarders, to the masters first, each with the timeout of
+the zone. The `dns_notify` module makes the DNS server reload its zones
+when a zone of a DNS partition changes; on a child DC it now watches
+the DomainDnsZones partition of its own domain.
+
+**DNS RPC server** (`source4/rpc_server/dnsserver/dnsharden.c`). The
+partitions of the RPC server get the legacy partition
+(`CN=MicrosoftDNS,CN=System,<domain>`, `DNS_DP_LEGACY`) and the local
+store (not DS-integrated). `ZoneCreate` with a zone type of forwarder or
+stub (or a primary zone with options) is handled here: the partition
+comes from the `DCPROMO` flags, `pszDpFqdn` or `dwDpFlags`, else from
+`harden:dns default zone partition`; the zone object and its
+`dNSProperty` values (type, masters as IP4 and DNS_ADDR arrays, timeout,
+recursion) are written in one transaction. `ZoneInfo` takes the masters,
+timeout and recursion from the properties; `EnumZones` applies the
+request filter by groups (zone type, DS integration, partition);
+`MasterServers`, `ResetDwordProperty` and `DeleteZone(FromDs)` are
+handled for these zones, and the DNS server is told to reload its zones
+(IRPC `dnssrv_reload_dns_zones`).
+
+**Recycle Bin** (`source4/dsdb/samdb/ldb_modules/`). `rootdse.c` checks
+the forest functional level, the scope and the Manage-Optional-Features
+right (`7c0e2a7c-a419-48e4-a995-10180aad54dd`) of the caller, writes
+`msDS-EnabledFeature` as system, and recycles the existing tombstones.
+`util.c` sees the feature enabled when the Partitions container lists
+it. `tombstone_reanimate.c` restores a deleted object without removing
+an `isRecycled` it does not have and without overwriting its attributes,
+and refuses recycled objects and missing parents. `objectclass.c` turns
+the delete of a deleted object into its recycling.
+`garbage_collect_tombstones.c` recycles the deleted objects after the
+deleted-object lifetime and removes the recycled ones after the
+tombstone lifetime. `extended_dn_out.c` hides the deactivated links.
+
+**One-level order** (`source4/dsdb/samdb/ldb_modules/onelevel_order.c`).
+The module is in the module stack after `server_sort`, below
+`paged_results`. For an untrusted (LDAP) one-level search without sort
+or VLV control, it keeps the entries, sorts them by RDN value
+(`strcasecmp_m()`, then `strcmp()`), and sends them before the done
+reply; the referrals and controls pass unchanged.
+
+
 Known limitations
 -----------------
 
@@ -514,6 +834,44 @@ Known limitations
   administration tools (object picker, Active Directory Users and
   Computers) against a Samba child domain.
 - `subdom_dc` is not in `script/autobuild.py` yet.
+- **Options (phase 4):** they are read when samba starts (restart it
+  after a change). `harden:multi-domain forest` must be set on every DC
+  of a multi-domain forest: a DC without it behaves as a DC of the
+  master branch and refuses the intra-forest trusts. The same for the
+  DNS options on the DCs that hold the partitions of the conditional
+  forwarders and stub zones, and for `harden:recycle bin` once the
+  Recycle Bin is enabled (a DC without it can't restore a deleted
+  object).
+- **Stub zones:** they are resolved by forwarding the queries to their
+  master servers. The SOA, NS and glue records are not transferred and
+  refreshed as on Windows, and the console shows no records in them.
+- **DNS console:** changing the type of a zone (`ZoneTypeReset`) or its
+  replication scope (`ZoneChangeDirectoryPartition`) is not implemented
+  (delete the zone and create it again), and `EnumDirectoryPartitions`
+  still lists only DomainDnsZones and ForestDnsZones. The IPv6 master
+  servers are only shown to the clients that use the `DNS_ADDR` arrays
+  (LONGHORN version, the console of current Windows versions). The
+  flags the console sends (partition, `EnumZones` filters) were taken
+  from [MS-DNSP] and `dnscmd`, not from captures of the console, which
+  was not tested yet.
+- **DNS storage:** the timeout and the "do not use recursion" setting of
+  a conditional forwarder stored in AD use two private `dNSProperty` ids
+  (`0xFF01`, `0xFF02`); how a Windows DC handles them was not tested.
+  The zones stored on one DC only need an administrator of the domain.
+  BIND9 DLZ does not know conditional forwarders and stub zones.
+- **Recycle Bin:** the deactivated links are hidden from the results of
+  the LDAP searches, but a search filter on a linked attribute still
+  matches them, and the replication of the deactivated links was not
+  compared with Windows. Restoring from the Active Directory
+  Administrative Center needs the HardenSamba ADWS service (branch
+  `fix/restore-deleted-objects`); which form of the restore request the
+  console sends is a deduction (the service accepts the three possible
+  ones).
+- **Order of the one-level searches:** only the one-level LDAP searches
+  without sort or VLV control are sorted, by RDN value, with the case
+  folding of Samba (`strcasecmp_m()`): the order of names with accents
+  may differ from the order of Windows. The entries of the search are
+  kept in memory until they are sorted.
 
 
 Active Directory Web Services (ADWS) advertisement
@@ -656,6 +1014,34 @@ Changes in detail
 | 46 | `selftest: test the phase 3 multi-domain features` | `python/samba/tests/subdomain.py` | 8 new tests in `samba.tests.subdomain`, see [Testing](#testing). |
 
 
+### Phase 4
+
+| # | Commit | Files | What and why |
+|---|--------|-------|--------------|
+| 47 | `s4:dsdb: make the multi-domain forest support an option` | `source4/dsdb/common/util.c`, `util_groups.c`, `source4/dsdb/repl/drepl_periodic.c`, `drepl_service.c`, `source4/dsdb/samdb/ldb_modules/descriptor.c`, `extended_dn_out.c`, `partition_init.c`, `repl_meta_data.c`, `samldb.c`, `selftest/target/Samba4.pm` | New `dsdb_lp_multi_domain_forest()` and `dsdb_multi_domain_forest()` (`harden:multi-domain forest`, off by default). Without the option, the dsdb code of phases 1 to 3 behaves as on the master branch (DSA of another domain, partial replica NC head, links to NCs we don't hold, forest root SID in the descriptors, LMDB map of the runtime partitions, pending backlinks, group scope and naming master checks, groups of the tokens, reload of the partitions). The DCs of the forest of `ad_dc_ntvfs` get the option in selftest. |
+| 48 | `s4: WITHIN_FOREST trusts only with "harden:multi-domain forest"` | `source4/kdc/db-glue.c`, `pac-glue.c`, `source4/auth/ntlm/auth_sam.c`, `auth_winbind.c`, `source4/rpc_server/lsa/dcesrv_lsa.c`, `lsa_lookup.c`, `source4/rpc_server/netlogon/dcerpc_netlogon.c` | Without the option: no inter-realm keys or referrals for a `WITHIN_FOREST` trust in the KDC, no intra-forest SID filtering, no NTLM pass-through to the domains of the forest, `CreateTrustedDomain*` refuses `WITHIN_FOREST`, the BUILTIN view cracks the UPNs, and Netlogon describes the domain as on master. |
+| 49 | `s3:winbindd: the domains of the forest only with "harden:multi-domain forest"` | `source3/winbindd/winbindd_util.c`, `winbindd_msrpc.c` | Without the option, the `WITHIN_FOREST` trusts are ignored, the namespaces are routed as on master and `LsapLookupGC` is not used. |
+| 50 | `python: join and replicate a child domain only with "harden:multi-domain forest"` | `python/samba/harden.py` (new), `python/samba/kcc/__init__.py`, `kcc_utils.py`, `python/samba/netcmd/domain/join.py`, `python/samba/tests/kcc/__init__.py` | `samba.harden` (names of the options, `lp_bool()`, `multi_domain_forest()`). The SUBDOMAIN join needs the option; without it the KCC runs as on master. |
+| 51 | `python:infrastructure: the role does nothing on a global catalog` | `python/samba/infrastructure.py`, `python/samba/netcmd/domain/infrastructure.py`, `python/samba/kcc/__init__.py`, `docs-xml/manpages/samba-tool.8.xml`, `python/samba/tests/subdomain.py` | As on Windows, the infrastructure master update does nothing on a GC and logs which DCs of the domain could hold the role; `samba-tool domain infrastructure-update` needs the multi-domain option; the DN-Binary and DN-String links (`msDS-RevealedUsers` of a RODC) no longer make it fail. New `test_infrastructure_master_on_gc`. |
+| 52 | `s4:dsdb: add the onelevel_order module ("harden:sort one-level results")` | `source4/dsdb/samdb/ldb_modules/onelevel_order.c` (new), `wscript_build_server`, `samba_dsdb.c` | Sorts by name the entries of the one-level LDAP searches without sort or VLV control, so that Active Directory Users and Computers shows the objects in alphabetical order. |
+| 53 | `s4:dsdb: enable the AD Recycle Bin for the forest ("harden:recycle bin")` | `source4/dsdb/common/util.c`, `source4/dsdb/samdb/ldb_modules/util.c`, `rootdse.c` | The Recycle Bin is enabled when the Partitions container lists it; `enableOptionalFeature` checks the forest functional level, the scope and the Manage-Optional-Features right of the caller, writes `msDS-EnabledFeature` as system and recycles the existing tombstones. New `dsdb_harden_recycle_bin()`, `dsdb_deleted_object_lifetime()`, `dsdb_check_optional_feature_forest()`. |
+| 54 | `s4:dsdb: delete, restore and recycle objects as Windows does` | `source4/dsdb/samdb/ldb_modules/objectclass.c`, `tombstone_reanimate.c`, `repl_meta_data.c`, `show_deleted.c`, `extended_dn_out.c`, `source4/dsdb/kcc/garbage_collect_tombstones.c`, `python/samba/tests/recycle_bin.py` (new), `selftest/tests.py` | Restore without `noSuchAttribute` and with the attributes, refused for recycled objects and missing parents; delete of a deleted object recycles it; recycling after the deleted-object lifetime; deactivated links hidden unless asked for; `msDS-LastKnownRDN` replaced. 9 tests. |
+| 55 | `librpc:dnsp: private dnsProperty ids for the conditional forwarders` | `librpc/idl/dnsp.idl`, `source4/dns_server/dnsserver_common.c` | `DSPROPERTY_ZONE_SAMBA_FORWARDER_TIMEOUT` (`0xFF01`) and `DSPROPERTY_ZONE_SAMBA_FORWARDER_SLAVE` (`0xFF02`), which [MS-DNSP] does not define. |
+| 56 | `s4:dns_server: resolve the conditional forwarders and stub zones` | `source4/dns_server/dns_harden.c` (new), `dns_harden_common.c` (new), `dns_harden_common.h` (new), `dns_server.c`, `dns_server.h`, `dns_query.c`, `dnsserver_common.h`, `wscript_build` | `harden:dns conditional forwarders`, `harden:dns stub zones`: the forwarder and stub zones (AD and local store) are forwarded to their masters, then to the global forwarders for a conditional forwarder that allows recursion. |
+| 57 | `s4:rpc_server:dnsserver: conditional forwarders, stub zones and the legacy partition` | `source4/rpc_server/dnsserver/dnsharden.c` (new), `dcerpc_dnsserver.c`, `dnsdb.c`, `dnsserver.h`, `source4/rpc_server/wscript_build` | Creation, description, listing, modification and deletion of conditional forwarders and stub zones from the DNS console, in the forest, domain or legacy partition or on the DC only; `harden:dns default zone partition`. |
+| 58 | `s4:dsdb:dns_notify: watch the DomainDnsZones of the domain of a child DC` | `source4/dsdb/samdb/ldb_modules/dns_notify.c` | The DNS server of a child DC did not reload its zones when a zone of its own DomainDnsZones changed (the forest root one was watched). |
+| 59 | `samba-tool dns: conditional forwarders, stub zones and the zone partitions` | `python/samba/netcmd/dns.py` | `zonecreate --type --master --forwarder-timeout --no-recursion --not-ds-integrated`, `--dns-directory-partition=legacy` and its default from `smb.conf`; `zonelist --forwarder --stub`. |
+| 60 | `selftest: test the phase 4 DNS and one-level options on subdom_dc` | `selftest/target/Samba4.pm`, `python/samba/tests/dns_harden.py` (new), `python/samba/tests/onelevel_order.py` (new), `source4/selftest/tests.py` | The DNS and one-level options on `subdom_dc`, `samba.tests.dns_harden` (6 tests) and `samba.tests.onelevel_order` (3 tests). |
+
+samba-adws, branch `fix/restore-deleted-objects` (on top of
+`fix/get-forwards-visibility-controls`), commit `e4d2182`
+(`Restore deleted objects in one undelete modify; enable optional features through the rootDSE`):
+a `Put` that removes `isDeleted` becomes the single undelete modify
+(`classes/directory/undelete_request.py`), and `ChangeOptionalFeature`
+uses the rootDSE `enableOptionalFeature` operation instead of writing
+the system-only `msDS-EnabledFeature`; tests and documentation updated.
+
+
 Testing
 -------
 
@@ -664,7 +1050,8 @@ Build with the selftest enabled, then run the multi-domain tests:
 ```
 ./configure --enable-selftest --enable-debug
 make -j$(nproc)
-make test TESTS="samba.tests.subdomain"
+make test TESTS="samba.tests.subdomain samba.tests.dns_harden \
+    samba.tests.onelevel_order samba.tests.recycle_bin"
 ```
 
 To get a shell in the test environment:
@@ -673,9 +1060,9 @@ To get a shell in the test environment:
 SELFTEST_TESTENV=subdom_dc make testenv
 ```
 
-`samba.tests.subdomain` (`python/samba/tests/subdomain.py`) has 22
+`samba.tests.subdomain` (`python/samba/tests/subdomain.py`) has 23
 tests: the 6 of phase 1 (state left by the join on both DCs), 8 for
-phase 2 and 8 for phase 3.
+phase 2, 8 for phase 3 and 1 for phase 4.
 
 Phase 2:
 
@@ -746,6 +1133,53 @@ Results on this branch (phase 3):
   was not run.
 
 
+Phase 4:
+
+| Test | Checks |
+|------|--------|
+| `samba.tests.subdomain`: `test_infrastructure_master_on_gc` | on the parent DC (a GC), the infrastructure master update does nothing and logs why, naming the DCs that are not GCs if there are some |
+| `samba.tests.dns_harden` (`subdom_dc`): `test_default_partition` | a zone created without a partition goes to ForestDnsZones (`harden:dns default zone partition = forest`) |
+| `test_legacy_partition` | a zone created with `DNS_DP_LEGACY` is in `CN=MicrosoftDNS,CN=System` of the domain partition, and `EnumZones` lists it with the legacy filter, not with the forest one |
+| `test_conditional_forwarder` | a conditional forwarder in DomainDnsZones, with the parent DC as master: in the forwarder list and not in the primary one, `ZoneInfo` (type, timeout 7, recursion, masters), a name of the parent zone resolved through the child DC, `ResetDwordProperty ForwarderSlave`, `MasterServers` with an IPv6 master, records refused, deleted |
+| `test_local_conditional_forwarder` | a conditional forwarder that is not in AD: no object in the directory, listed with the `NON_DS` filter, `fUseDatabase` 0, resolved, deleted with `DeleteZone` |
+| `test_stub_zone` | a stub zone in ForestDnsZones: in the stub list, of type stub, resolved through its master |
+| `test_disabled_on_parent` | the parent DC, without the options, refuses a conditional forwarder (`WERR_CALL_NOT_IMPLEMENTED`), as the master branch does |
+| `samba.tests.onelevel_order` (`subdom_dc`) | the children of an OU (OUs and contacts with mixed-case names created in random order) come back sorted by name, also through the pages of a paged search (page size 7), and an explicit `server_sort` (reverse) still decides |
+| `samba.tests.recycle_bin` (no environment) | on a domain provisioned by the test with `harden:recycle bin`: enabled by the Administrator, an old tombstone recycled, a deleted user keeps its attributes and is restored with them (with and without a client control), delete / restore / delete again, a deleted object recycled by a delete and no longer restorable, a missing parent refused (`2089`), the deactivated links |
+
+Results on this branch (phase 4):
+
+- `samba.tests.subdomain`: 23/23 OK; `samba.tests.dns_harden`: 6/6 OK;
+  `samba.tests.onelevel_order`: 3/3 OK; `samba.tests.recycle_bin`:
+  9/9 OK; `samba.tests.kcc` on `vampire_dc` and `promoted_dc`,
+  `samba.tests.kcc.graph`, `.graph_utils`, `.ldif_import_export`,
+  `.kcc_utils`: ALL OK.
+- DNS, with the options on `subdom_dc` only: `samba.tests.dns` on
+  `fl2003dc`, `rodc` and `vampire_dc`, `samba.tests.dns_aging`,
+  `samba.tests.dns_forwarder` (`fl2003dc`), `samba.tests.dns_tkey`
+  (`fl2008r2dc`), `samba.tests.dns_wildcard`, `.dns_invalid`,
+  `.dns_packet` (`ad_dc`), `samba.tests.dcerpc.dnsserver` (`ad_dc_ntvfs`,
+  `ad_dc`), `samba.tests.samba_tool.dnscmd` (`chgdcpass`): ALL OK.
+- Options off (the `ad_dc` domain and the `fl*` environments set none of
+  them; `ad_dc_ntvfs` only sets `harden:multi-domain forest`):
+  `samba4.tombstone_reanimation.python`, `samba4.ldap.vlv.python`
+  (`ad_dc_slowtests`), `samba4.ldap.dirsync.python`,
+  `samba4.ldap.linked_attributes.python` (`ad_dc`),
+  `samba4.ldap.sort.python`, `samba4.deletetest.python`,
+  `samba.tests.dsdb`, `samba.tests.dcerpc.lsa` (`ad_dc_default`),
+  `samba4.blackbox.trust_ntlm` (`fl2008r2dc`, `fl2003dc`, `fl2000dc`,
+  `ad_member`, `nt4_member`), `samba.tests.samba_tool.help`,
+  `samba.tests.source`, `samba.tests.source_chars`: ALL OK (419 tests).
+- samba-adws: `tests/dc/test_undelete_request.py` 5/5 OK (on a domain
+  provisioned with this branch, options off), the level 0 suite 295/295
+  OK, `tools/norms`, ruff, flake8 and `mypy --strict` clean on the
+  changed files.
+- Not tested: the Windows DNS console, the Active Directory
+  Administrative Center and Active Directory Users and Computers
+  against these features (no Windows client in this environment), and
+  the full Samba test suite.
+
+
 Roadmap
 -------
 
@@ -754,6 +1188,13 @@ of the other domains in the tokens, Infrastructure Master, Domain Naming
 Master, global catalog of a child domain, ForestDnsZones on the child
 DCs, `parent_index` and the forest flags in Netlogon, SID filtering
 inside the forest, the missing backlink and the KCC verification.
+
+Done in phase 4: every feature behind an option of `smb.conf`, the
+Infrastructure Master role disabled on a GC, conditional forwarders and
+stub zones (AD, with the three replication scopes, or local), the
+default partition of a new DNS zone, the AD Recycle Bin and the restore
+from the Active Directory Administrative Center (with samba-adws), the
+order of the objects in Active Directory Users and Computers.
 
 1. **References without a GC:** phantoms (or an equivalent) so that any
    DC can store a member of another domain; universal group lookup from
@@ -768,7 +1209,12 @@ inside the forest, the missing backlink and the KCC verification.
    its crossRef on the naming master once its last DC is gone).
 4. **Interoperability:** Samba child domain under a Windows forest root
    and the reverse, Windows administration tools against a Samba child
-   domain; `subdom_dc` in autobuild.
+   domain; `subdom_dc` in autobuild; captures of the DNS console, of the
+   Active Directory Administrative Center and of Active Directory Users
+   and Computers against the phase 4 features.
+5. **DNS:** zone transfers for the stub zones, change of the type and of
+   the replication scope of a zone, the legacy partition in
+   `EnumDirectoryPartitions`, BIND9 DLZ.
 
 
 Submitting upstream
