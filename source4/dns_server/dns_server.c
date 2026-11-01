@@ -857,6 +857,25 @@ static NTSTATUS dns_server_reload_zones(struct dns_server *dns)
 	if (!NT_STATUS_IS_OK(status)) {
 		return status;
 	}
+	if (dns->harden.forwarders || dns->harden.stubs) {
+		/*
+		 * the conditional forwarders and stub zones are not
+		 * authoritative zones
+		 */
+		struct dns_forward_zone *new_fwd = NULL;
+		struct dns_forward_zone *old_fwd = dns->forward_zones;
+		struct dns_forward_zone *fz = NULL;
+
+		status = dns_harden_split_zones(dns, dns, &new_list, &new_fwd);
+		if (!NT_STATUS_IS_OK(status)) {
+			return status;
+		}
+		dns->forward_zones = new_fwd;
+		while ((fz = DLIST_TAIL(old_fwd)) != NULL) {
+			DLIST_REMOVE(old_fwd, fz);
+			talloc_free(fz);
+		}
+	}
 	dns->zones = new_list;
 	while ((old_zone = DLIST_TAIL(old_list)) != NULL) {
 		DLIST_REMOVE(old_list, old_zone);
@@ -929,6 +948,7 @@ static NTSTATUS dns_task_init(struct task_server *task)
 	}
 
 	dns->task = task;
+	dns_harden_get_options(task->lp_ctx, &dns->harden);
 
 	dns->server_credentials = cli_credentials_init(dns);
 	if (!dns->server_credentials) {

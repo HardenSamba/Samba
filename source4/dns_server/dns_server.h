@@ -55,12 +55,23 @@ struct dns_server_tkey_store {
 	uint16_t size;
 };
 
+/* a conditional forwarder or a stub zone, see dns_harden.c */
+struct dns_forward_zone {
+	struct dns_forward_zone *prev, *next;
+	const char *name;
+	struct dns_zone_forwarding zf;
+	bool local;
+};
+
 struct dns_server {
 	struct task_server *task;
 	struct ldb_context *samdb;
 	struct dns_server_zone *zones;
 	struct dns_server_tkey_store *tkeys;
 	struct cli_credentials *server_credentials;
+	/* Harden-Box options and forwarded zones */
+	struct dns_harden_options harden;
+	struct dns_forward_zone *forward_zones;
 };
 
 struct dns_request_state {
@@ -93,6 +104,12 @@ WERROR dns_server_process_update(struct dns_server *dns,
 				 struct dns_res_rec **updates,    uint16_t *update_count,
 				 struct dns_res_rec **additional, uint16_t *arcount);
 
+NTSTATUS dns_harden_split_zones(struct dns_server *dns,
+				TALLOC_CTX *mem_ctx,
+				struct dns_server_zone **zones,
+				struct dns_forward_zone **fwd);
+const struct dns_forward_zone *dns_harden_forward_zone(
+	struct dns_server *dns, const char *name);
 bool dns_authoritative_for_zone(struct dns_server *dns,
 				const char *name);
 const char *dns_get_authoritative_zone(struct dns_server *dns,

@@ -964,6 +964,8 @@ struct dns_server_process_query_state {
 	struct dns_res_rec *additional;
 	uint16_t arcount;
 	struct forwarder_string *forwarders;
+	/* timeout of each forwarder of a conditional forwarder zone */
+	uint32_t forward_timeout;
 };
 
 static void dns_server_process_query_got_auth(struct tevent_req *subreq);
@@ -1017,6 +1019,71 @@ struct tevent_req *dns_server_process_query_send(
 							 struct forwarder_string);
 		f->forwarder = forwarders[i];
 		DLIST_ADD_END(state->forwarders, f);
+	}
+
+	{
+		/*
+		 * A conditional forwarder or a stub zone (Harden-Box):
+		 * its master servers first, then the forwarders of the
+		 * server unless the zone says not to recurse.
+		 */
+		const struct dns_forward_zone *fz =
+			dns_harden_forward_zone(dns, in->questions[0].name);
+
+		if (fz != NULL) {
+			struct forwarder_string *fwd = NULL;
+			uint32_t m;
+
+			for (m = 0; m < fz->zf.num_masters; m++) {
+				struct forwarder_string *f = talloc_zero(
+					state, struct forwarder_string);
+				if (tevent_req_nomem(f, req)) {
+					return tevent_req_post(req, ev);
+				}
+				f->forwarder = fz->zf.masters[m];
+				DLIST_ADD_END(fwd, f);
+			}
+			if (fz->zf.slave ||
+			    fz->zf.zone_type == DNS_ZONE_TYPE_STUB) {
+				state->forwarders = NULL;
+			}
+			if (fwd != NULL) {
+				DLIST_CONCATENATE(fwd, state->forwarders);
+				state->forwarders = fwd;
+			}
+			if (state->forwarders == NULL) {
+				DBG_NOTICE("Zone %s has no master server\n",
+					   fz->name);
+				tevent_req_werror(req, DNS_ERR(SERVER_FAILURE));
+				return tevent_req_post(req, ev);
+			}
+
+			DBG_DEBUG("'%s' is in the %s zone %s, asking %s\n",
+				  in->questions[0].name,
+				  fz->zf.zone_type == DNS_ZONE_TYPE_STUB ?
+				  "stub" : "conditional forwarder",
+				  fz->name, state->forwarders->forwarder);
+			req_state->flags |= DNS_FLAG_RECURSION_AVAIL;
+			state->forward_timeout = fz->zf.timeout;
+
+			subreq = ask_forwarder_send(state, ev,
+						    state->forwarders->forwarder,
+						    &in->questions[0]);
+			if (tevent_req_nomem(subreq, req)) {
+				return tevent_req_post(req, ev);
+			}
+			if (!tevent_req_set_endtime(
+				    subreq, ev,
+				    timeval_current_ofs(state->forward_timeout,
+							0))) {
+				tevent_req_oom(req);
+				return tevent_req_post(req, ev);
+			}
+			tevent_req_set_callback(
+				subreq, dns_server_process_query_got_response,
+				req);
+			return req;
+		}
 	}
 
 	if (dns_authoritative_for_zone(dns, in->questions[0].name)) {
@@ -1102,6 +1169,13 @@ static void dns_server_process_query_got_response(struct tevent_req *subreq)
 					    state->question);
 
 		if (tevent_req_nomem(subreq, req)) {
+			return;
+		}
+		if (state->forward_timeout != 0 &&
+		    !tevent_req_set_endtime(
+			    subreq, state->ev,
+			    timeval_current_ofs(state->forward_timeout, 0))) {
+			tevent_req_oom(req);
 			return;
 		}
 

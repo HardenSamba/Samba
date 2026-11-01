@@ -141,4 +141,6 @@ uint32_t unix_to_dns_timestamp(time_t t);
  */
 NTSTATUS dns_timestamp_to_nt_time(NTTIME *_nt, uint32_t t);
 
+#include "dns_server/dns_harden_common.h"
+
 #endif /* __DNSSERVER_COMMON_H__ */
