@@ -1467,7 +1467,8 @@ static krb5_error_code samba_kdc_get_user_info_from_pac(TALLOC_CTX *mem_ctx,
 			goto out;
 		}
 
-		if (samba_kdc_entry_pac_issued_by_trust(entry)) {
+		if (samba_kdc_entry_pac_issued_by_trust(entry) &&
+		    dsdb_multi_domain_forest(samdb)) {
 			/*
 			 * SID filtering of a PAC that comes from
 			 * another domain of our forest, see

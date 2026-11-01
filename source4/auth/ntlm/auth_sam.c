@@ -1413,7 +1413,8 @@ static NTSTATUS authsam_want_check(struct auth_method_context *ctx,
 			samdb_domain_sid(ctx->auth_ctx->sam_ctx);
 
 		if (our_sid != NULL && tdo->sid != NULL &&
-		    !dom_sid_equal(our_sid, tdo->sid))
+		    !dom_sid_equal(our_sid, tdo->sid) &&
+		    dsdb_multi_domain_forest(ctx->auth_ctx->sam_ctx))
 		{
 			/*
 			 * Another domain of our forest: winbindd

@@ -1321,6 +1321,15 @@ static NTSTATUS dcesrv_lsa_CreateTrustedDomain_precheck(
 		 */
 		NTSTATUS status;
 
+		if (!dsdb_multi_domain_forest(policy_state->sam_ldb)) {
+			/*
+			 * Without "harden:multi-domain forest = yes",
+			 * we don't allow additional domains in our
+			 * forest.
+			 */
+			return NT_STATUS_NOT_SUPPORTED;
+		}
+
 		status = dcesrv_lsa_check_within_forest_trust(
 				mem_ctx, policy_state->sam_ldb, info);
 		if (!NT_STATUS_IS_OK(status)) {

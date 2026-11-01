@@ -1658,7 +1658,8 @@ static NTSTATUS dcesrv_lsa_lookup_name_builtin(
 	if (!is_builtin && item->hints.domain != NULL) {
 		return NT_STATUS_NONE_MAPPED;
 	}
-	if (!is_builtin && item->hints.namespace != NULL) {
+	if (!is_builtin && item->hints.namespace != NULL &&
+	    dsdb_multi_domain_forest(state->policy_state->sam_ldb)) {
 		/*
 		 * This is 'something@namespace', an UPN never maps
 		 * to BUILTIN. Don't try to crack it here: the UPN of

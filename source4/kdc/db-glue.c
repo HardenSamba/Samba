@@ -3164,8 +3164,19 @@ static krb5_error_code samba_kdc_trust_message2entry(krb5_context context,
 	/*
 	 * LSA_TRUST_ATTRIBUTE_WITHIN_FOREST (parent-child trust inside
 	 * our forest) works like the other uplevel trusts here: the
-	 * inter-realm keys come from trustAuthIncoming/Outgoing.
+	 * inter-realm keys come from trustAuthIncoming/Outgoing, when
+	 * the multi-domain forest support is enabled.
 	 */
+	if ((tdo->trust_attributes & LSA_TRUST_ATTRIBUTE_WITHIN_FOREST) &&
+	    !dsdb_lp_multi_domain_forest(kdc_db_ctx->lp_ctx))
+	{
+		/*
+		 * We don't support WITHIN_FOREST then
+		 */
+		krb5_clear_error_message(context);
+		ret = SDB_ERR_NOENTRY;
+		goto out;
+	}
 
 	if (tdo->trust_attributes & LSA_TRUST_ATTRIBUTE_PIM_TRUST) {
 		/*
@@ -4504,6 +4515,17 @@ static krb5_error_code samba_kdc_lookup_realm(krb5_context context,
 	if (tdo == NULL) {
 		/*
 		 * This principal has to be local
+		 */
+		TALLOC_FREE(frame);
+		return 0;
+	}
+
+	if ((tdo->trust_attributes & LSA_TRUST_ATTRIBUTE_WITHIN_FOREST) &&
+	    !dsdb_lp_multi_domain_forest(kdc_db_ctx->lp_ctx))
+	{
+		/*
+		 * Without the multi-domain forest support, just
+		 * search in our local database.
 		 */
 		TALLOC_FREE(frame);
 		return 0;

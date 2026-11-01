@@ -3509,10 +3509,13 @@ static NTSTATUS dcesrv_netr_LogonGetDomainInfo(struct dcesrv_call_state *dce_cal
 		 * domains of the domains of our forest, and the DNS
 		 * name of the forest.
 		 */
-		status = netr_fix_forest_domain_info(mem_ctx, sam_ctx,
-						     domain_info);
-		if (!NT_STATUS_IS_OK(status)) {
-			return status;
+		if (dsdb_multi_domain_forest(sam_ctx)) {
+			status = netr_fix_forest_domain_info(mem_ctx,
+							     sam_ctx,
+							     domain_info);
+			if (!NT_STATUS_IS_OK(status)) {
+				return status;
+			}
 		}
 
 		/* Sets the supported encryption types */
@@ -4619,8 +4622,17 @@ static WERROR fill_trusted_domains_array(TALLOC_CTX *mem_ctx,
 		}
 
 		trusts->array[n].trust_flags = flags;
-		/* see fill_forest_trusts_array() for the forest flags */
-		trusts->array[n].parent_index = 0;
+		if (dsdb_multi_domain_forest(sam_ctx)) {
+			/*
+			 * see fill_forest_trusts_array() for the forest
+			 * flags
+			 */
+			trusts->array[n].parent_index = 0;
+		} else if ((trust_flags & NETR_TRUST_FLAG_IN_FOREST) &&
+			   !(flags & NETR_TRUST_FLAG_TREEROOT)) {
+			/* TODO: find if we have parent in the list */
+			trusts->array[n].parent_index = 0;
+		}
 
 		trusts->array[n].trust_type =
 				ldb_msg_find_attr_as_uint(dom_res[i],
@@ -4889,6 +4901,9 @@ static WERROR dcesrv_netr_DsrEnumerateDomainTrusts(struct dcesrv_call_state *dce
 {
 	struct netr_DomainTrustList *trusts;
 	struct ldb_context *sam_ctx;
+	int ret;
+	struct ldb_message **dom_res;
+	const char * const dom_attrs[] = { "objectSid", "objectGUID", NULL };
 	struct loadparm_context *lp_ctx = dce_call->conn->dce_ctx->lp_ctx;
 	const char *dnsdomain = lpcfg_dnsdomain(lp_ctx);
 	const char *p;
@@ -4930,14 +4945,61 @@ static WERROR dcesrv_netr_DsrEnumerateDomainTrusts(struct dcesrv_call_state *dce
 		return WERR_GEN_FAILURE;
 	}
 
-	/*
-	 * Our direct trusts and the domains of our forest (we may be
-	 * a child domain), each with all its flags, keeping those that
-	 * match one of the requested flags.
-	 */
-	werr = fill_forest_trusts_array(mem_ctx, sam_ctx,
-					trusts, r->in.trust_flags);
-	W_ERROR_NOT_OK_RETURN(werr);
+	if (dsdb_multi_domain_forest(sam_ctx)) {
+		/*
+		 * Our direct trusts and the domains of our forest (we
+		 * may be a child domain), each with all its flags,
+		 * keeping those that match one of the requested flags.
+		 */
+		werr = fill_forest_trusts_array(mem_ctx, sam_ctx,
+						trusts, r->in.trust_flags);
+		W_ERROR_NOT_OK_RETURN(werr);
+
+		return WERR_OK;
+	}
+
+	if ((r->in.trust_flags & NETR_TRUST_FLAG_INBOUND) ||
+	    (r->in.trust_flags & NETR_TRUST_FLAG_OUTBOUND)) {
+
+		werr = fill_trusted_domains_array(mem_ctx, sam_ctx,
+						  trusts, r->in.trust_flags);
+		W_ERROR_NOT_OK_RETURN(werr);
+	}
+
+	/* NOTE: we currently are always the root of the forest */
+	if (r->in.trust_flags & NETR_TRUST_FLAG_IN_FOREST) {
+		uint32_t n = trusts->count;
+
+		ret = gendb_search_dn(sam_ctx, mem_ctx, NULL,
+				      &dom_res, dom_attrs);
+		if (ret != 1) {
+			return WERR_GEN_FAILURE;
+		}
+
+		trusts->count = n + 1;
+		trusts->array = talloc_realloc(trusts, trusts->array,
+					       struct netr_DomainTrust,
+					       trusts->count);
+		W_ERROR_HAVE_NO_MEMORY(trusts->array);
+
+		trusts->array[n].netbios_name = lpcfg_workgroup(lp_ctx);
+		trusts->array[n].dns_name = lpcfg_dnsdomain(lp_ctx);
+		trusts->array[n].trust_flags =
+			NETR_TRUST_FLAG_NATIVE |
+			NETR_TRUST_FLAG_TREEROOT |
+			NETR_TRUST_FLAG_IN_FOREST |
+			NETR_TRUST_FLAG_PRIMARY;
+		/* we are always the root domain for now */
+		trusts->array[n].parent_index = 0;
+		trusts->array[n].trust_type = LSA_TRUST_TYPE_UPLEVEL;
+		trusts->array[n].trust_attributes = 0;
+		trusts->array[n].sid = samdb_result_dom_sid(mem_ctx,
+							    dom_res[0],
+							    "objectSid");
+		trusts->array[n].guid = samdb_result_guid(dom_res[0],
+							  "objectGUID");
+		talloc_free(dom_res);
+	}
 
 	return WERR_OK;
 }

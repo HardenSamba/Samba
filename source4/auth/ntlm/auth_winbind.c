@@ -79,6 +79,9 @@ static NTSTATUS winbind_filter_within_forest_sids(
 	if (user_info_dc->num_sids == 0 || ctx->auth_ctx->sam_ctx == NULL) {
 		return NT_STATUS_OK;
 	}
+	if (!dsdb_multi_domain_forest(ctx->auth_ctx->sam_ctx)) {
+		return NT_STATUS_OK;
+	}
 
 	domain_sid = user_info_dc->sids[0].sid;
 	if (!sid_split_rid(&domain_sid, NULL)) {
