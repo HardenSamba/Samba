@@ -63,6 +63,57 @@ struct winbind_check_password_state {
 static void winbind_check_password_done(struct tevent_req *subreq);
 
 /*
+ * The domain of the user is another domain of our forest: apply the
+ * SID filtering of its WITHIN_FOREST trust.
+ */
+static NTSTATUS winbind_filter_within_forest_sids(
+				struct auth_method_context *ctx,
+				struct auth_user_info_dc *user_info_dc)
+{
+	struct dsdb_trust_routing_table *table = NULL;
+	const struct lsa_TrustDomainInfoInfoEx *tdo = NULL;
+	struct dom_sid domain_sid;
+	TALLOC_CTX *frame = NULL;
+	NTSTATUS status;
+
+	if (user_info_dc->num_sids == 0 || ctx->auth_ctx->sam_ctx == NULL) {
+		return NT_STATUS_OK;
+	}
+
+	domain_sid = user_info_dc->sids[0].sid;
+	if (!sid_split_rid(&domain_sid, NULL)) {
+		return NT_STATUS_OK;
+	}
+
+	frame = talloc_stackframe();
+	status = dsdb_trust_routing_table_load(ctx->auth_ctx->sam_ctx, frame,
+					       &table);
+	if (!NT_STATUS_IS_OK(status)) {
+		TALLOC_FREE(frame);
+		return status;
+	}
+
+	tdo = dsdb_trust_domain_by_sid(table, &domain_sid, NULL);
+	if (tdo == NULL || tdo->sid == NULL ||
+	    !(tdo->trust_attributes & LSA_TRUST_ATTRIBUTE_WITHIN_FOREST) ||
+	    dom_sid_equal(tdo->sid,
+			  samdb_domain_sid(ctx->auth_ctx->sam_ctx))) {
+		/* not another domain of our forest */
+		TALLOC_FREE(frame);
+		return NT_STATUS_OK;
+	}
+
+	status = dsdb_trust_filter_within_forest_sids(tdo->trust_attributes,
+						      tdo->sid,
+						      "NTLM pass-through",
+						      &user_info_dc->num_sids,
+						      user_info_dc->sids);
+	TALLOC_FREE(frame);
+	return status;
+}
+
+
+/*
  Authenticate a user with a challenge/response
  using IRPC to the winbind task
 */
@@ -265,6 +316,15 @@ static void winbind_check_password_done(struct tevent_req *subreq)
 				return;
 			}
 		}
+	}
+
+	/*
+	 * SID filtering of the answer of a DC of another domain of our
+	 * forest, see dsdb_trust_filter_within_forest_sids().
+	 */
+	status = winbind_filter_within_forest_sids(ctx, state->user_info_dc);
+	if (tevent_req_nterror(req, status)) {
+		return;
 	}
 
 	/*
