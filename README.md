@@ -9,22 +9,29 @@ Samba adds the support of **multi-domain Active Directory forests**
 original Samba README follows below, after the "About Samba" heading.
 
 > **Warning: experimental, do not use in production.** Phase 1 created
-> a child domain and started its first DC. Phase 2 makes the two domains
+> a child domain and started its first DC. Phase 2 made the two domains
 > work together: Kerberos and NTLM across the domains, LSA name and SID
 > lookups, the forest root groups in the child domain, replication in
 > both directions and a global catalog that holds the child domain.
-> Several things are still missing, see
+> Phase 3 adds the members of a group that come from another domain, the
+> universal groups of the other domains in the tokens, the global catalog
+> of the child domain (which now holds the forest root domain), the
+> forest partitions on the child DC, the Infrastructure Master and the
+> Domain Naming Master roles, the forest view of Netlogon and the SID
+> filtering inside the forest. Several things are still missing, see
 > [Known limitations](#known-limitations).
 
 - Base: Samba `master` at commit `f6fddd2232c9` (4.26.0pre1, 2026-10-30)
-- Branch: `_Harden-Box-Multi-domains-supports-phase2`, on top of
-  `_Harden-Box-Multi-domains-supports-phase1`
+- Branch: `_Harden-Box-Multi-domains-supports-phase3`, on top of
+  `_Harden-Box-Multi-domains-supports-phase2` (itself on top of
+  `_Harden-Box-Multi-domains-supports-phase1`)
 - Phase 1: 11 code commits for the multi-domain work, 1 commit that
   makes the DC advertise Active Directory Web Services (see
   [ADWS advertisement](#active-directory-web-services-adws-advertisement))
   and its documentation
 - Phase 2: 15 code commits (numbered 13 to 27 in
-  [Changes in detail](#changes-in-detail)) and this documentation
+  [Changes in detail](#changes-in-detail)) and their documentation
+- Phase 3: 19 code commits (numbered 28 to 46) and this documentation
 
 
 Context
@@ -44,11 +51,17 @@ yet" (KDC, winbindd), "TODO: handle multiple domains in a forest"
 
 - **Phase 1** brought the join of a new child domain back, fixed
   everything that broke on the way, and added a test environment.
-- **Phase 2** (this branch) handles the intra-forest
-  (`WITHIN_FOREST`) trusts in the KDC, in winbindd, in the NTLM
-  pass-through and in LSA, gives the forest root groups their place in
-  the child domain, lets the DCs of the two domains replicate, and lets
-  a global catalog hold the other domain.
+- **Phase 2** handles the intra-forest (`WITHIN_FOREST`) trusts in the
+  KDC, in winbindd, in the NTLM pass-through and in LSA, gives the
+  forest root groups their place in the child domain, lets the DCs of
+  the two domains replicate, and lets a global catalog hold the other
+  domain.
+- **Phase 3** (this branch) handles the references between the domains
+  (members of a group from another domain, backlinks, universal groups
+  in the tokens, Infrastructure Master), completes the global catalog of
+  a child domain and the forest partitions of its DC, implements the
+  Domain Naming Master checks, and reviews Netlogon and the SID
+  filtering for the domains of the forest.
 
 
 Usage
@@ -84,7 +97,10 @@ What the join does:
 2. Creates the server object, then the crossRef of the new domain and its
    nTDSDSA object on the naming master with `DsAddEntry`. The nCName
    carries the GUID and the SID of the new domain.
-3. Replicates the Schema and Configuration NCs.
+3. Replicates the Schema and Configuration NCs, and the ForestDnsZones
+   NC (phase 3, unless `--dns-backend=NONE`); the new DC is added to the
+   replica locations of ForestDnsZones (`msDS-NC-Replica-Locations` of
+   its crossRef).
 4. Provisions the new domain NC locally (`FILL_SUBDOMAIN`), with its
    DomainDnsZones partition.
 5. Adds the Enterprise Admins group of the forest root to the
@@ -109,6 +125,24 @@ samba-tool drs replicate <parent DC> <child DC> CN=Configuration,DC=example,DC=c
 
 On a global catalog of another domain, the KCC then adds the partial
 replica of the new domain (`samba-tool drs kcc <GC>` runs it at once).
+If the new DC is a global catalog, its KCC adds the partial replicas of
+the domains that already existed, including the forest root domain
+(phase 3).
+
+The Infrastructure Master of each domain updates, once an hour from the
+KCC, the references of its domain NC to the objects of the other domains
+of the forest (phase 3). It can also be run by hand, on any writable DC
+of the domain (`--dry-run` lists the references without changing them):
+
+```
+samba-tool domain infrastructure-update -H /var/lib/samba/private/sam.ldb \
+    [--gc=ldap://<global catalog>:3268] [--dry-run] [--force]
+```
+
+`--gc` is only needed on a DC that is not a global catalog and can't find
+one by itself; `--force` runs it on a DC that is not the Infrastructure
+Master. The interval of the KCC run is set by
+`kcc:infrastructure update interval = <seconds>` in `smb.conf`.
 
 
 What works
@@ -158,6 +192,52 @@ Phase 2:
   (`instanceType` 9: NC head, NC above) and is searchable on port 3268:
   a search from the root of the forest finds the objects of both
   domains.
+
+Phase 3:
+
+- **members from another domain:** a user of the child domain is added
+  to a universal or a domain local group of the forest root domain (with
+  LDAP: the user is found on the global catalog, where the "Browse"
+  button of the Windows tools looks for it); a global group refuses it,
+  as on Windows. The reference keeps the GUID and SID of the user, and the
+  user gets the `memberOf` of the group on the global catalogs;
+- **universal groups in the tokens:** the token of that user has the
+  universal group of the forest root domain on the DCs of both domains
+  (Kerberos and NTLM), and the domain local group only on the DC of the
+  forest root domain, where it applies;
+- **global catalog of a child domain:** the KCC of a GC of the child
+  domain adds the partial replica of the forest root domain (and of
+  every domain that existed before it), which replicates and is
+  searchable on port 3268: a search from the root of the forest on the
+  child DC finds the objects of both domains;
+- **backlinks:** the `serverReferenceBL` of the child DC on the global
+  catalog of the parent domain is there: `samba-tool dbcheck
+  --cross-ncs` finds no error on either DC;
+- **forest partitions:** the child DC holds the Schema, Configuration
+  and ForestDnsZones partitions, replicated in both directions, and
+  serves the `_msdcs` zone of the forest;
+- **Netlogon:** `DsrEnumerateDomainTrusts` lists every domain of the
+  forest, with the `TREEROOT`, `PRIMARY`, `IN_FOREST`, `NATIVE`,
+  `INBOUND`/`OUTBOUND` flags and the `parent_index` of the child domain
+  (the index of its parent in the returned list); `LogonGetDomainInfo`
+  gives the forest name and the same flags;
+- **SID filtering inside the forest:** the SIDs that a domain of the
+  forest may not send (well-known SIDs of the local machine, local
+  accounts, SIDs of other authorities) are removed from the PACs and the
+  NTLM tokens that come from another domain of the forest, as described
+  by [MS-PAC] 4.1.2.2;
+- **Domain Naming Master:** only the naming master adds or deletes a
+  crossRef; a crossRef needs a unique `dnsRoot` and NetBIOS name; the
+  crossRef of a domain that still has DCs can't be deleted; the role
+  moves between the DCs of the two domains (`samba-tool fsmo transfer
+  --role=naming`);
+- **Infrastructure Master:** on a DC that is not a global catalog, the
+  references to the objects of the other domains are updated (renamed
+  or moved target) or removed (deleted target) by the Infrastructure
+  Master of the domain, from the KCC or with `samba-tool domain
+  infrastructure-update`;
+- **KCC:** `samba.tests.kcc` passes on `promoted_dc` and `vampire_dc`
+  with a child domain in the forest.
 
 
 How phase 2 works
@@ -240,40 +320,199 @@ partial replica only has the attributes of the partial attribute set.
 Neither is an error any more.
 
 
+How phase 3 works
+-----------------
+
+**Members from another domain** (`source4/dsdb/samdb/ldb_modules/samldb.c`).
+Windows stores the reference to an object of a domain it doesn't hold
+as a phantom. Samba has no phantoms, but a global catalog holds a
+partial replica of every domain of the forest, so a DC that is a GC
+already finds the user of another domain, and the link keeps its GUID
+and SID (`extended_dn_store`), like a link to a local object. What was
+missing are the group scope rules of Active Directory: a member of
+another domain may only be added to a universal or a domain local group,
+and may not be a domain local group itself. `samldb` now refuses the
+other cases (`LDB_ERR_UNWILLING_TO_PERFORM`). The "Browse" button of the
+Windows tools uses the object picker, which searches the global
+catalog: the objects of the other domains are there (not tested with a
+Windows client yet).
+
+**Universal groups in the tokens** (`source4/dsdb/common/util_groups.c`).
+The groups of a user come from the `memberOf` backlinks of its object,
+including those of the groups of another domain held in a partial
+replica. Only the universal groups of another domain apply outside of
+it: its global and domain local groups are now skipped (and not
+expanded) when the token is built. The DC of the domain that owns the
+group adds its domain local groups itself, when the user reaches it
+(Kerberos referral, NTLM pass-through).
+
+**Backlinks of the partial replicas**
+(`source4/dsdb/samdb/ldb_modules/repl_meta_data.c`). When a link is
+replicated before its target (the `serverReference` of a DC of the child
+domain arrives with the Configuration NC, before the partial replica of
+the child domain on the GC of the parent domain), the backlink could not
+be added, and was never added afterwards. Windows keeps a phantom for
+it. `repl_meta_data` now records such a backlink in the
+`@REPLMD_PENDING_BACKLINKS` record (GUID of the target, backlink
+attribute, extended DN of the source) and adds it at the end of the
+replication transaction that brings the target; the record is removed
+when it is empty, and a link removed in the meantime removes its pending
+backlink.
+
+**Global catalog of a child domain** (`python/samba/kcc/__init__.py`,
+`source4/dsdb/common/util.c`, `source4/dsdb/pydsdb.c`, `lib/ldb/ldb_mdb/`,
+`source4/dsdb/samdb/ldb_modules/partition_init.c`). The (uninstantiated)
+NC head of a partial replica was only created with the crossRef of a new
+domain: a GC of a child domain never got the forest root domain, which
+existed before it. The KCC now creates the missing NC head from the
+crossRef (with the GUID and SID of the NC) before it adds the replica
+to `hasPartialReplicaNCs`. As nothing is above the forest root NC on a
+child DC, `INSTANCE_TYPE_NC_ABOVE` is only set when we hold the NC
+above. The LMDB database of a partition created at runtime used the
+LMDB default map size (1 MiB, `MDB_MAP_FULL` when the forest root domain
+replicates): it now gets the 8 GiB of a provision (reserved address
+space only), and `lmdb_connect()` reads the map size from the options of
+the connection (those of the partition) before those of the ldb. The
+KCC builds the intra-site ring of a NC only from its full writable
+replicas: the partial replica of a GC of another domain is not a source.
+
+**KCC verification** (`python/samba/kcc/__init__.py`). `samba_kcc
+--verify` (`samba.tests.kcc`) failed on `vampire_dc` and `promoted_dc`
+once the forest had a child domain, depending on the timing, for two
+reasons. Once the KCC of a DC of the parent domain (they are all global
+catalogs) has added the partial replica of the child domain, the graph
+of the child domain NC built on that DC holds the full replica of the
+child DC and the partial replicas of the GCs, which only receive edges:
+it is connected, but it is not the double ring that the verification
+required. The double ring is now only checked when our own replica is
+full. And with four DCs in a site (three DCs of the parent domain and
+the child DC), the graph of the connections seen by a DC is not
+connected until the KCC of every other DC has run and its connection
+objects have replicated: the DSAs with no connection at all yet (in
+either direction) are left out of the verification, when the site has
+more than three DCs.
+
+**Forest partitions on a child DC** (`python/samba/join.py`). The join of
+a child domain now replicates the ForestDnsZones partition with the
+Schema and Configuration NCs (it holds the `_msdcs` zone of the
+forest), lists it in the `msDS-hasMasterNCs` of the new DC, and adds the
+new DC to the `msDS-NC-Replica-Locations` of its crossRef, so that the
+KCC of the other DCs replicates it with the new DC.
+
+**Netlogon** (`source4/rpc_server/netlogon/dcerpc_netlogon.c`).
+`DsrEnumerateDomainTrusts` only listed our own domain and the trusted
+domain objects, with `parent_index` always 0. It now lists every domain
+of the forest, from the crossRefs of the Partitions container, merged
+with the trusted domain objects of our direct trusts: `IN_FOREST` and
+`NATIVE` for all of them, `TREEROOT` for a domain with no `trustParent`,
+`PRIMARY` for our domain, `INBOUND`/`OUTBOUND` for the direct trusts,
+and `parent_index` set to the index of the parent domain in the returned
+list ([MS-NRPC] 2.2.1.6.2). The entries are filtered with the requested
+flags. `LogonGetDomainInfo` gets the DNS name of the forest and the same
+flags and parent index.
+
+**SID filtering inside the forest** (`source4/dsdb/common/util_trusts.c`,
+`source4/kdc/pac-glue.c`, `source4/auth/ntlm/auth_winbind.c`). New
+`dsdb_trust_filter_within_forest_sids()`, applied by the KDC to the PAC
+of a ticket issued by another domain of the forest, and to the answer of
+the NTLM pass-through for a user of another domain of the forest,
+following [MS-PAC] 4.1.2.2: with a `WITHIN_FOREST` trust, the SIDs of
+the "AlwaysFilter" category are removed (Null, World, Local, Creator
+authorities, `S-1-5-x` well-known and BUILTIN SIDs, partially formed
+`S-1-5-21` SIDs...); with a quarantined trust
+(`TRUST_ATTRIBUTE_QUARANTINED_DOMAIN`), only the SIDs of the trusted
+domain, Enterprise Domain Controllers and the "NeverFilter" SIDs
+(`S-1-5-15`, `S-1-5-1000-*`, `S-1-16-*`, `S-1-18-*`...) pass. If the
+user or primary group SID would be removed, the authentication is
+refused. The external and forest trusts keep the filtering they had.
+
+**Domain Naming Master** (`source4/dsdb/samdb/ldb_modules/samldb.c`).
+`samldb` now checks, for the add and the delete of a crossRef (outside
+of a provision, and unless the relax control is given), that this DC is
+the naming master (`fSMORoleOwner` of the Partitions container,
+`WERR_DS_INCORRECT_ROLE_OWNER` otherwise); that a new domain crossRef
+has a `dnsRoot` and a NetBIOS name; that no other crossRef has the same
+`dnsRoot` or NetBIOS name (`WERR_DS_CROSS_REF_EXISTS`); and that a
+deleted domain crossRef has no DC left (`msDS-HasDomainNCs` of an
+nTDSDSA object, `WERR_DS_NC_STILL_HAS_DSAS`). The join of a child domain
+already goes to the naming master with `DsAddEntry`; the role transfer
+(`becomeDomainMaster`) already existed.
+
+**Infrastructure Master** (`python/samba/infrastructure.py`,
+`python/samba/netcmd/domain/infrastructure.py`, `python/samba/kcc/`). On
+a GC, the references to the objects of other domains are kept up to
+date by the replication of their partial replica (Samba already updates
+or removes the links of a renamed or deleted object). A DC that is not a
+GC has nothing to follow them with. The Infrastructure Master of the
+domain (`fSMORoleOwner` of `CN=Infrastructure`) now looks up, in the
+global catalog, the target of each forward link of its domain NC that
+points to another domain of the forest (by GUID, deleted objects
+included), and replaces the value when the target was renamed or moved,
+or removes it when the target was deleted. The change is an originating
+write, which replicates to the other DCs of the domain. The KCC runs it
+on the Infrastructure Master once an hour (when the forest has other
+domains), and `samba-tool domain infrastructure-update` runs it by hand.
+
+**dbcheck** (`python/samba/dbchecker.py`). On a GC of a child domain, the
+NC head of its own domain is below the partial replica of the forest
+root domain, which arrived after it: whether `INSTANCE_TYPE_NC_ABOVE` is
+set or not is not an error.
+
+
 Known limitations
 -----------------
 
-- **No phantoms:** Samba can't store a reference to an object of a NC
-  it doesn't hold. The forest root groups are referenced in the child
-  domain through `foreignSecurityPrincipal` objects (Windows uses
-  phantoms). Adding a user or group of one domain to a group of another
-  domain of the forest, the universal groups of the other domains in the
-  tokens (from the GC) and the Infrastructure Master duties are not done
-  nor tested.
-- **Backlinks on a global catalog:** a link replicated before the partial
-  replica of its target (e.g. the `serverReference` of the DCs of the
-  child domain, in the Configuration NC) has no backlink on the copy of
-  the target in the partial replica. `samba-tool dbcheck` reports it.
-- **Netlogon:** `DsrEnumerateDomainTrusts` always returns
-  `parent_index = 0`.
-- **DNS:** the ForestDnsZones partition is not replicated to the child
-  DC.
-- **SID filtering** inside the forest was not reviewed.
+- **No phantoms:** Samba still can't store a reference to an object it
+  doesn't hold. A member of another domain can only be added on a DC
+  that holds its partial replica, i.e. a global catalog (Windows creates
+  a phantom on any DC); on another DC the object is not found. The
+  Enterprise Admins and Schema Admins of the forest root are still
+  referenced in the groups of a child domain through
+  `foreignSecurityPrincipal` objects (phase 2), as the join creates the
+  child domain before it holds the forest root domain.
+- **Universal groups:** the universal groups of the other domains are
+  only in the tokens built by a DC that holds their partial replica (a
+  global catalog). A DC that is not a GC does not ask a GC for them at
+  logon, and the universal group membership caching of Windows (for the
+  sites without a GC) is not implemented.
+- **Pending backlinks:** the backlinks waiting for their target are kept
+  in the local `@REPLMD_PENDING_BACKLINKS` record of each DC; `dbcheck`
+  does not look at it, and a backlink whose target never arrives stays
+  there.
+- **Infrastructure Master:** written in Python and run by the KCC (at
+  most once an hour by default), not by the replication service. On a
+  DC that is not a GC it needs another GC reachable over LDAP (port
+  3268). Only the forward links of the domain NC are checked; it does
+  nothing on a GC, which is already up to date (as on Windows, the
+  Infrastructure Master should not be a GC unless every DC of the
+  domain is one).
+- **SID filtering:** only the intra-forest filtering was added. A
+  `WITHIN_FOREST` trust is only quarantined when
+  `TRUST_ATTRIBUTE_QUARANTINED_DOMAIN` is set by hand on its trusted
+  domain object. The SID history of the users of the other domains of
+  the forest is kept, as on Windows.
+- **Netlogon:** `DsrEnumerateDomainTrusts` and `LogonGetDomainInfo` were
+  reviewed; the other calls that describe the forest
+  (`DsrGetForestTrustInformation`, `DsrGetDcName` for another domain of
+  the forest, ...) were not.
+- **Domain Naming Master:** over LDAP, the `nCName` of a new crossRef
+  must already exist (it is checked earlier, by `extended_dn_store`):
+  application partitions are not created through a crossRef added first
+  on the naming master. The checks are skipped during a provision and
+  with the relax control.
+- **KCC verification:** when a site has more than three DCs,
+  `samba_kcc --verify` leaves out of the graph verification the DSAs
+  that have no connection at all yet, and the graph of a NC we hold a
+  partial replica of is only checked for connectivity; this only changes
+  the verification, not the topology the KCC builds.
 - Only a forest root and one child domain, with one DC each, were
   tested: no grandchild or tree root domain (referrals over more than one
   trust), no second DC or RODC in the child domain, no schema change
   replicated from the root to the child.
 - Only tested with Samba DCs on both sides. A Samba child domain under a
-  Windows forest root, and the reverse, are not tested.
-- **Global catalog of a child domain:** a GC only gets the partial
-  replica of the domains created after it joined (the uninstantiated NC
-  head comes with the crossRef of the new domain). A GC of a child
-  domain does not hold the forest root domain yet.
-- **KCC verification:** `samba.tests.kcc` on `promoted_dc` (a third DC
-  of the parent domain) fails when the forest has a child domain: seen
-  from that DC, the graph of the connection objects of the site is not
-  connected until the KCC of the other DCs has run. It failed in the
-  same way (and also on `vampire_dc`) with the phase 1 code.
+  Windows forest root, and the reverse, are not tested, nor the Windows
+  administration tools (object picker, Active Directory Users and
+  Computers) against a Samba child domain.
 - `subdom_dc` is not in `script/autobuild.py` yet.
 
 
@@ -392,6 +631,31 @@ Changes in detail
 | 27 | `selftest: replicate subdom_dc with its parent, test the cross-domain features` | `selftest/target/Samba4.pm`, `python/samba/tests/subdomain.py` | `setup_subdom_dc()` replicates the Configuration NC in both directions. 8 new tests in `samba.tests.subdomain` (Kerberos, NTLM, forest root groups and token, LSA, replication, KCC, global catalog). |
 
 
+### Phase 3
+
+| # | Commit | Files | What and why |
+|---|--------|-------|--------------|
+| 28 | `ldb:mdb: the options of the connection set the LMDB map size` | `lib/ldb/ldb_mdb/ldb_mdb.c` | `lmdb_connect()` only read `lmdb_env_size` from the options of the ldb, never from those given to the connection, so a partition backend could not get its own map size. The options of the connection now win. |
+| 29 | `s4:dsdb:partition: a full LMDB map for the partitions created at runtime` | `source4/dsdb/samdb/ldb_modules/partition_init.c` | A partition created at runtime (a partial replica added by the KCC) got the LMDB default map size, 1 MiB, and its replication failed with `MDB_MAP_FULL`. It now gets the 8 GiB of a provision (reserved address space), unless its options set `lmdb_env_size`. |
+| 30 | `s4:dsdb: no NC_ABOVE on a partial replica with no NC above it` | `source4/dsdb/common/util.c` | `dsdb_create_partial_replica_NC()` always set `INSTANCE_TYPE_NC_ABOVE`. The partial replica of the forest root domain on a GC of a child domain has nothing above it: the flag is now only set when we hold the NC above. |
+| 31 | `pydsdb: add _dsdb_create_partial_replica_NC()` | `source4/dsdb/pydsdb.c` | Python binding of `dsdb_create_partial_replica_NC()`, for the KCC. |
+| 32 | `python:kcc: a global catalog of a child domain holds the forest root domain` | `python/samba/kcc/__init__.py` | `refresh_gc_partial_replicas()` creates the missing NC head of a partial replica from the crossRef of the domain (GUID and SID), instead of skipping the domains that existed before the GC (the forest root domain, seen from a child domain); a failure is logged and the NC skipped. The intra-site ring of a NC only uses its full writable replicas, not the partial replica of a GC of another domain. |
+| 33 | `python:kcc: fix the graph verification in a multi-domain forest` | `python/samba/kcc/__init__.py` | When our replica of a NC is partial, the read-write graph is only checked for connectivity (the partial replicas only receive edges, it is not a double ring); with more than three DCs in the site, the DSAs with no connection at all yet (their KCC results have not replicated to us) are left out of the `--verify` graph checks. `samba.tests.kcc` failed on `vampire_dc` and `promoted_dc` once their KCC had added the partial replica of the child domain. |
+| 34 | `s4:dsdb:repl_meta_data: add the backlinks of links replicated before their target` | `source4/dsdb/samdb/ldb_modules/repl_meta_data.c` | A replicated link whose target is not there yet (the `serverReference` of a child DC on the GC of the parent domain) had no backlink, ever. The backlink is now recorded in `@REPLMD_PENDING_BACKLINKS` and added when the target is replicated (at the end of that transaction); `serverReferenceBL` was the only error reported by `dbcheck`. |
+| 35 | `samba-tool domain join: replicate ForestDnsZones to the DC of a new child domain` | `python/samba/join.py` | The ForestDnsZones partition belongs to the whole forest: the join of a child domain replicates it, lists it in `msDS-hasMasterNCs` and adds the new DC to the `msDS-NC-Replica-Locations` of its crossRef. |
+| 36 | `s4:dsdb:samldb: the group scope rules for the members of another domain` | `source4/dsdb/samdb/ldb_modules/samldb.c` | A member of another domain of the forest (found in its partial replica on a GC) may only be added to a universal or domain local group, and may not be a domain local group itself (`LDB_ERR_UNWILLING_TO_PERFORM`). |
+| 37 | `s4:dsdb:util_groups: only the universal groups of the other domains` | `source4/dsdb/common/util_groups.c` | `dsdb_expand_nested_groups()` skips the global and domain local groups of another domain (from `memberOf` on a GC): only its universal groups apply outside of it. Without it, the token of a user of the child domain got the domain local groups of the forest root domain on the child DC. |
+| 38 | `s4:dsdb:util_trusts: SID filtering of the intra-forest trusts` | `source4/dsdb/common/util_trusts.c`, `source4/dsdb/pydsdb.c`, `python/samba/tests/dsdb_trust_sid_filter.py` (new), `selftest/tests.py` | New `dsdb_trust_filter_within_forest_sids()` ([MS-PAC] 4.1.2.2, `WithinForest` and `QuarantinedWithinForest`), its Python binding `_dsdb_trust_filter_within_forest_sids()` and 5 unit tests. |
+| 39 | `s4:kdc: filter the SIDs of a PAC issued by another domain of the forest` | `source4/kdc/pac-glue.c` | The KDC applies the intra-forest SID filtering to the PAC of a ticket issued by another domain of the forest (`KRB5KDC_ERR_POLICY` if the user or primary group SID is filtered). |
+| 40 | `s4:auth:ntlm: filter the SIDs of the users of the other domains of the forest` | `source4/auth/ntlm/auth_winbind.c` | The same filtering for the answer of the NTLM pass-through (winbindd) for a user of another domain of the forest. |
+| 41 | `s4:rpc_server:netlogon: list the domains of the forest with their parent` | `source4/rpc_server/netlogon/dcerpc_netlogon.c` | `DsrEnumerateDomainTrusts` lists every domain of the forest (crossRefs) merged with our direct trusts, with the `IN_FOREST`, `NATIVE`, `TREEROOT`, `PRIMARY`, `INBOUND`/`OUTBOUND` flags and `parent_index` (it was always 0); `LogonGetDomainInfo` gets the forest name and the same flags. |
+| 42 | `s4:dsdb:samldb: crossRefs are added and deleted on the domain naming master` | `source4/dsdb/samdb/ldb_modules/samldb.c` | Add and delete of a crossRef only on the naming master (`WERR_DS_INCORRECT_ROLE_OWNER`); `dnsRoot` and NetBIOS name required for a domain crossRef and unique in the forest (`WERR_DS_CROSS_REF_EXISTS`); a domain crossRef can't be deleted while a DC hosts the domain (`WERR_DS_NC_STILL_HAS_DSAS`). |
+| 43 | `python: add the infrastructure master update` | `python/samba/infrastructure.py` (new), `python/samba/netcmd/domain/infrastructure.py` (new), `python/samba/netcmd/domain/__init__.py`, `docs-xml/manpages/samba-tool.8.xml` | `InfrastructureUpdate` looks up in a GC the targets of the links of our domain NC to the other domains of the forest, and updates (rename, move) or removes (delete) them. `samba-tool domain infrastructure-update` runs it (`--dry-run`, `--gc`, `--force`), documented in the samba-tool man page. |
+| 44 | `python:kcc: run the infrastructure master update` | `python/samba/kcc/__init__.py` | On the Infrastructure Master of a domain of a multi-domain forest, the KCC runs the update at most every `kcc:infrastructure update interval` seconds (3600 by default), with a GC found in the forest when this DC is not one. |
+| 45 | `python:dbcheck: NC_ABOVE below a partial replica is fine` | `python/samba/dbchecker.py` | On a GC of a child domain, the NC head of its domain is below the partial replica of the forest root domain, which arrived after it: `INSTANCE_TYPE_NC_ABOVE` set or not is not an error. |
+| 46 | `selftest: test the phase 3 multi-domain features` | `python/samba/tests/subdomain.py` | 8 new tests in `samba.tests.subdomain`, see [Testing](#testing). |
+
+
 Testing
 -------
 
@@ -409,9 +673,11 @@ To get a shell in the test environment:
 SELFTEST_TESTENV=subdom_dc make testenv
 ```
 
-`samba.tests.subdomain` (`python/samba/tests/subdomain.py`) has 14
-tests: the 6 of phase 1 (state left by the join on both DCs) and 8 for
-phase 2:
+`samba.tests.subdomain` (`python/samba/tests/subdomain.py`) has 22
+tests: the 6 of phase 1 (state left by the join on both DCs), 8 for
+phase 2 and 8 for phase 3.
+
+Phase 2:
 
 | Test | Checks |
 |------|--------|
@@ -424,39 +690,58 @@ phase 2:
 | `test_kcc_cross_domain` | the KCC runs on both DCs, and each one has a connection from the DC of the other domain |
 | `test_global_catalog` | the KCC of the parent GC adds the partial replica of the child domain, which replicates, is instantiated and is searchable on port 3268 |
 
-The `subdom_dc` environment now replicates the Configuration NC in both
+Phase 3:
+
+| Test | Checks |
+|------|--------|
+| `test_forest_partitions_on_child` | the child DC holds the Schema, Configuration and ForestDnsZones NCs (`namingContexts`, `msDS-hasMasterNCs`, replica locations of the ForestDnsZones crossRef), serves the `_msdcs` zone of the forest, and ForestDnsZones replicates in both directions |
+| `test_child_global_catalog` | the KCC of the child DC (a GC) adds the partial replica of the forest root domain (`instanceType` 1: NC head, nothing above), and a search on its port 3268 finds the Administrator of both domains |
+| `test_partial_replica_backlinks` | on the GC of the parent domain, the computer object of the child DC has its `serverReferenceBL` |
+| `test_cross_domain_membership` | a user of the child domain in a universal and a domain local group of the forest root domain (the reference carries its SID), refused in a global group; the user has the `memberOf` of the universal group on the GC |
+| `test_universal_groups_in_tokens` | the token of that user, with Kerberos and NTLM, has the universal group on both DCs, and the domain local group only on the DC of the forest root domain |
+| `test_netlogon_domain_trusts` | `DsrEnumerateDomainTrusts` on both DCs: both domains, `IN_FOREST`, `NATIVE`, `TREEROOT` (root only), `PRIMARY` (own domain only), `INBOUND`/`OUTBOUND`, SIDs, and `parent_index` of the child domain pointing to the forest root |
+| `test_domain_naming_master` | the crossRef of the child domain can't be deleted, the child DC (not the naming master) refuses a new crossRef even for an Enterprise Admin, the naming master refuses a duplicate `dnsRoot`, the role moves to the child DC and back |
+| `test_infrastructure_update` | on the parent DC, the infrastructure master finds nothing to update (it is a GC); seen through a global catalog where the user of the child domain was renamed, then deleted, the references of the two groups are updated, then removed |
+
+`samba.tests.dsdb_trust_sid_filter` (`python/samba/tests/dsdb_trust_sid_filter.py`,
+5 tests, no environment needed) checks the SID filtering of the
+intra-forest trusts: what passes a `WITHIN_FOREST` trust and a
+quarantined one, the user and primary group SIDs that make the
+authentication fail, and that the other trusts are left alone.
+
+The `subdom_dc` environment replicates the Configuration NC in both
 directions when it starts, as the other DC environments do.
 
-Results on this branch:
+Results on this branch (phase 3):
 
-- `samba.tests.subdomain`: 14/14 OK.
-- No regression in: `samba4.blackbox.trust_ntlm` (`fl2008r2dc` forest
-  trust, `fl2003dc` external trust), `samba4.blackbox.trust_utils(fl2008r2dc)`,
-  `samba3.wbinfo_simple.trust` (the 4 variants on `fl2008r2dc`),
-  `samba.tests.dcerpc.lsa(ad_dc_default)`,
-  `samba4.rpc.lsalookup` (ncacn_np, seal, `ad_dc_ntvfs`),
-  `samba3.wbinfo_name_lookup(ad_member)`,
-  `samba.tests.krb5.kdc_tgs_tests(ad_dc)`,
-  `samba4.drs.replica_sync(vampire_dc)`, `samba4.drs.repl_rodc(ad_dc)`,
+- `samba.tests.subdomain`: 22/22 OK; `samba.tests.dsdb_trust_sid_filter`:
+  5/5 OK.
+- `samba-tool dbcheck --cross-ncs` after the replications and the KCC
+  runs: no error on either DC.
+- No regression in: `samba.tests.provision`, `samba.tests.dsdb(ad_dc_default)`,
   `samba4.blackbox.dbcheck` (`alpha13`, `release-4-1-6-partial-object`,
   `release-4-5-0-pre1`, each with `.quick`), `samba4.blackbox.dbcheck-links`,
   `samba.tests.kcc.graph`, `.graph_utils`, `.ldif_import_export`,
-  `.kcc_utils(ad_dc_default)`, and `samba.tests.kcc` on `vampire_dc` and
-  `promoted_dc` (see [Known limitations](#known-limitations) for
-  `promoted_dc` when the forest has a child domain).
-- `samba4.blackbox.kinit_trust` (`fl2008r2dc`, `fl2003dc`): all OK
-  except "check time with kerberos ccache", which fails in this build
-  environment because `samba-tool` is started there with a Python
-  interpreter that has no `ldb` module; it does not depend on this
-  branch.
-- `samba-tool dbcheck --cross-ncs` after the replications: no error on
-  the child DC; on the parent DC, the missing backlink described in
-  [Known limitations](#known-limitations).
+  `samba3.wbinfo_name_lookup(ad_member)`, `samba4.rpc.lsalookup` (ncacn_np,
+  seal, `ad_dc_ntvfs`), `samba4.rpc.netlogon` and `samba4.rpc.netlogon.admin`
+  (ncacn_ip_tcp, seal, `ad_dc_ntvfs`), `samba4.rpc.netlogon` (seal, `ad_dc`),
+  `samba4.blackbox.trust_ntlm` (`fl2008r2dc` forest trust, `fl2003dc`
+  external trust), `samba4.blackbox.trust_utils(fl2008r2dc)`,
+  `samba3.wbinfo_simple.trust` (the 4 variants on `fl2008r2dc`),
+  `samba.tests.dcerpc.lsa(ad_dc_default)`.
 - With the child domain in the forest (`samba.tests.subdomain` run
-  first): `samba4.blackbox.join_ldapcmp` (5 environments) and
-  `samba4.drs.repl_secdesc`, `samba4.drs.repl_move`,
-  `samba4.drs.link_conflicts` on `vampire_dc`: ALL OK.
-- The other phase 1 suites (provision, dsdb, sddl, security descriptors,
+  first): `samba4.urgent_replication(ad_dc)`, `samba4.blackbox.join_ldapcmp`
+  (5 environments), `samba4.drs.replica_sync`, `samba4.drs.repl_move` and
+  `samba4.drs.link_conflicts` on `vampire_dc`, `samba4.drs.repl_rodc(ad_dc)`,
+  `samba.tests.krb5.kdc_tgs_tests(ad_dc)`, `samba.tests.kcc.kcc_utils(ad_dc_default)`,
+  and `samba.tests.kcc` on `vampire_dc` and `promoted_dc`, also after
+  their KCC added the partial replica of the child domain (it failed
+  every time in that case before commit 33): ALL OK.
+- `samba4.blackbox.kinit_trust(fl2008r2dc)`: all OK except "check time
+  with kerberos ccache", which fails in this build environment because
+  `samba-tool` is started there with a Python interpreter that has no
+  `ldb` module; it does not depend on this branch.
+- The other phase 1 suites (sddl, security descriptors,
   upgradeprovision) were not run again, and the full Samba test suite
   was not run.
 
@@ -464,16 +749,26 @@ Results on this branch:
 Roadmap
 -------
 
-1. **Cross-domain references:** phantoms (or an equivalent) for the
-   members of a group that belong to another domain, Infrastructure
-   Master, universal groups of the other domains in the tokens.
-2. **Netlogon:** `parent_index` in `DsrEnumerateDomainTrusts`, and a
-   review of the other calls that list the domains of the forest.
-3. **DNS:** ForestDnsZones on the DCs of the child domains.
-4. **Bigger forests:** grandchild and tree root domains (referrals over
-   several trusts), several DCs and RODCs per domain, schema updates.
-5. **Interoperability:** Samba child domain under a Windows forest root
-   and the reverse; `subdom_dc` in autobuild.
+Done in phase 3: members from another domain (on a GC), universal groups
+of the other domains in the tokens, Infrastructure Master, Domain Naming
+Master, global catalog of a child domain, ForestDnsZones on the child
+DCs, `parent_index` and the forest flags in Netlogon, SID filtering
+inside the forest, the missing backlink and the KCC verification.
+
+1. **References without a GC:** phantoms (or an equivalent) so that any
+   DC can store a member of another domain; universal group lookup from
+   a GC at logon on the DCs that are not GCs (and its caching); direct
+   references to Enterprise Admins and Schema Admins instead of the
+   `foreignSecurityPrincipal` objects.
+2. **Netlogon:** review of the other calls that describe the forest
+   (`DsrGetForestTrustInformation`, `DsrGetDcName` for another domain).
+3. **Bigger forests:** grandchild and tree root domains (referrals over
+   several trusts), several DCs and RODCs per domain, schema updates,
+   the removal of a child domain (`samba-tool domain` command to delete
+   its crossRef on the naming master once its last DC is gone).
+4. **Interoperability:** Samba child domain under a Windows forest root
+   and the reverse, Windows administration tools against a Samba child
+   domain; `subdom_dc` in autobuild.
 
 
 Submitting upstream

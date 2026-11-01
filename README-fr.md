@@ -11,21 +11,30 @@ dans [README.md](README.md), après la partie Harden-Box.
 
 > **Attention : expérimental, à ne pas utiliser en production.** La
 > phase 1 a créé un domaine enfant et démarré son premier DC. La phase 2
-> fait fonctionner les deux domaines ensemble : Kerberos et NTLM d'un
+> a fait fonctionner les deux domaines ensemble : Kerberos et NTLM d'un
 > domaine à l'autre, recherches de noms et de SID par LSA, groupes de la
 > racine dans le domaine enfant, réplication dans les deux sens et
-> catalogue global qui contient le domaine enfant. Plusieurs points
-> manquent encore, voir [Limites connues](#limites-connues).
+> catalogue global qui contient le domaine enfant. La phase 3 ajoute les
+> membres d'un groupe venant d'un autre domaine, les groupes universels
+> des autres domaines dans les jetons, le catalogue global du domaine
+> enfant (qui contient désormais le domaine racine), les partitions de
+> la forêt sur le DC enfant, les rôles de maître d'infrastructure et de
+> maître d'attribution des noms de domaine, la vue de la forêt dans
+> Netlogon et le filtrage de SID à l'intérieur de la forêt. Plusieurs
+> points manquent encore, voir [Limites connues](#limites-connues).
 
 - Base : `master` de Samba au commit `f6fddd2232c9` (4.26.0pre1, 30/10/2026)
-- Branche : `_Harden-Box-Multi-domains-supports-phase2`, au-dessus de
-  `_Harden-Box-Multi-domains-supports-phase1`
+- Branche : `_Harden-Box-Multi-domains-supports-phase3`, au-dessus de
+  `_Harden-Box-Multi-domains-supports-phase2` (elle-même au-dessus de
+  `_Harden-Box-Multi-domains-supports-phase1`)
 - Phase 1 : 11 commits de code pour le multi-domaine, 1 commit qui fait
   annoncer Active Directory Web Services par le DC (voir
   [Annonce ADWS](#annonce-dactive-directory-web-services-adws)) et sa
   documentation
 - Phase 2 : 15 commits de code (numérotés de 13 à 27 dans
-  [Modifications en détail](#modifications-en-détail)) et cette
+  [Modifications en détail](#modifications-en-détail)) et leur
+  documentation
+- Phase 3 : 19 commits de code (numérotés de 28 à 46) et cette
   documentation
 
 
@@ -47,11 +56,18 @@ winbindd), « TODO: handle multiple domains in a forest » (LSA), etc.
 
 - La **phase 1** a rétabli la création d'un domaine enfant, corrigé tout
   ce qui bloquait en chemin et ajouté un environnement de test.
-- La **phase 2** (cette branche) gère les trusts internes à la forêt
-  (`WITHIN_FOREST`) dans le KDC, dans winbindd, dans le relais NTLM et
-  dans LSA, donne aux groupes de la racine leur place dans le domaine
-  enfant, fait répliquer les DC des deux domaines et permet à un
-  catalogue global de contenir l'autre domaine.
+- La **phase 2** gère les trusts internes à la forêt (`WITHIN_FOREST`)
+  dans le KDC, dans winbindd, dans le relais NTLM et dans LSA, donne aux
+  groupes de la racine leur place dans le domaine enfant, fait répliquer
+  les DC des deux domaines et permet à un catalogue global de contenir
+  l'autre domaine.
+- La **phase 3** (cette branche) gère les références entre domaines
+  (membres d'un groupe venant d'un autre domaine, backlinks, groupes
+  universels dans les jetons, maître d'infrastructure), complète le
+  catalogue global d'un domaine enfant et les partitions de la forêt sur
+  son DC, met en place les contrôles du maître d'attribution des noms de
+  domaine, et revoit Netlogon et le filtrage de SID pour les domaines de
+  la forêt.
 
 
 Utilisation
@@ -89,7 +105,10 @@ Ce que fait le join :
 2. Il crée l'objet serveur, puis le crossRef du nouveau domaine et son
    objet nTDSDSA sur le maître d'attribution des noms avec `DsAddEntry`.
    Le nCName porte le GUID et le SID du nouveau domaine.
-3. Il réplique les NC Schema et Configuration.
+3. Il réplique les NC Schema et Configuration, ainsi que le NC
+   ForestDnsZones (phase 3, sauf avec `--dns-backend=NONE`) ; le nouveau
+   DC est ajouté aux emplacements de réplique de ForestDnsZones
+   (`msDS-NC-Replica-Locations` de son crossRef).
 4. Il provisionne localement le NC du nouveau domaine
    (`FILL_SUBDOMAIN`), avec sa partition DomainDnsZones.
 5. Il ajoute le groupe Enterprise Admins de la racine aux
@@ -115,7 +134,26 @@ samba-tool drs replicate <DC parent> <DC enfant> CN=Configuration,DC=example,DC=
 
 Sur un catalogue global d'un autre domaine, le KCC ajoute ensuite la
 réplique partielle du nouveau domaine (`samba-tool drs kcc <GC>` le
-lance tout de suite).
+lance tout de suite). Si le nouveau DC est catalogue global, son KCC
+ajoute les répliques partielles des domaines qui existaient déjà, dont
+le domaine racine de la forêt (phase 3).
+
+Le maître d'infrastructure de chaque domaine met à jour, une fois par
+heure depuis le KCC, les références de son NC de domaine vers les objets
+des autres domaines de la forêt (phase 3). Il peut aussi être lancé à la
+main, sur n'importe quel DC en écriture du domaine (`--dry-run` liste
+les références sans les modifier) :
+
+```
+samba-tool domain infrastructure-update -H /var/lib/samba/private/sam.ldb \
+    [--gc=ldap://<catalogue global>:3268] [--dry-run] [--force]
+```
+
+`--gc` ne sert que sur un DC qui n'est pas catalogue global et qui ne
+trouve pas de GC tout seul ; `--force` le lance sur un DC qui n'est pas
+le maître d'infrastructure. L'intervalle de l'exécution par le KCC se
+règle avec `kcc:infrastructure update interval = <secondes>` dans
+`smb.conf`.
 
 
 Ce qui fonctionne
@@ -168,6 +206,54 @@ Phase 2 :
   (`instanceType` 9 : tête de NC, NC au-dessus) et peut être interrogée
   sur le port 3268 : une recherche depuis la racine de la forêt trouve
   les objets des deux domaines.
+
+Phase 3 :
+
+- **membres venant d'un autre domaine :** un utilisateur du domaine
+  enfant est ajouté à un groupe universel ou de domaine local du domaine
+  racine (en LDAP : l'utilisateur est trouvé sur le catalogue global, là
+  où le bouton « Parcourir » des outils Windows le cherche) ;
+  un groupe global le refuse, comme sous Windows. La référence garde le
+  GUID et le SID de l'utilisateur, et l'utilisateur obtient le
+  `memberOf` du groupe sur les catalogues globaux ;
+- **groupes universels dans les jetons :** le jeton de cet utilisateur
+  contient le groupe universel du domaine racine sur les DC des deux
+  domaines (Kerberos et NTLM), et le groupe de domaine local uniquement
+  sur le DC du domaine racine, où il s'applique ;
+- **catalogue global d'un domaine enfant :** le KCC d'un GC du domaine
+  enfant ajoute la réplique partielle du domaine racine (et de chaque
+  domaine qui existait avant lui), qui se réplique et peut être
+  interrogée sur le port 3268 : une recherche depuis la racine de la
+  forêt sur le DC enfant trouve les objets des deux domaines ;
+- **backlinks :** le `serverReferenceBL` du DC enfant est présent sur le
+  catalogue global du domaine parent : `samba-tool dbcheck --cross-ncs`
+  ne trouve aucune erreur sur les deux DC ;
+- **partitions de la forêt :** le DC enfant détient les partitions
+  Schema, Configuration et ForestDnsZones, répliquées dans les deux
+  sens, et sert la zone `_msdcs` de la forêt ;
+- **Netlogon :** `DsrEnumerateDomainTrusts` liste tous les domaines de
+  la forêt, avec les drapeaux `TREEROOT`, `PRIMARY`, `IN_FOREST`,
+  `NATIVE`, `INBOUND`/`OUTBOUND` et le `parent_index` du domaine enfant
+  (l'indice de son parent dans la liste renvoyée) ; `LogonGetDomainInfo`
+  donne le nom de la forêt et les mêmes drapeaux ;
+- **filtrage de SID dans la forêt :** les SID qu'un domaine de la forêt
+  n'a pas le droit d'envoyer (SID bien connus de la machine locale,
+  comptes locaux, SID d'autres autorités) sont retirés des PAC et des
+  jetons NTLM venant d'un autre domaine de la forêt, comme le décrit
+  [MS-PAC] 4.1.2.2 ;
+- **maître d'attribution des noms de domaine :** seul le maître
+  d'attribution des noms ajoute ou supprime un crossRef ; un crossRef
+  doit avoir un `dnsRoot` et un nom NetBIOS uniques ; le crossRef d'un
+  domaine qui a encore des DC ne peut pas être supprimé ; le rôle passe
+  d'un DC à l'autre entre les deux domaines (`samba-tool fsmo transfer
+  --role=naming`) ;
+- **maître d'infrastructure :** sur un DC qui n'est pas catalogue
+  global, les références vers les objets des autres domaines sont mises
+  à jour (cible renommée ou déplacée) ou retirées (cible supprimée) par
+  le maître d'infrastructure du domaine, depuis le KCC ou avec
+  `samba-tool domain infrastructure-update` ;
+- **KCC :** `samba.tests.kcc` passe sur `promoted_dc` et `vampire_dc`
+  avec un domaine enfant dans la forêt.
 
 
 Fonctionnement de la phase 2
@@ -255,44 +341,214 @@ Objects d'une réplique partielle n'a que les attributs de l'ensemble
 partiel. Ce ne sont plus des erreurs.
 
 
+Fonctionnement de la phase 3
+----------------------------
+
+**Membres venant d'un autre domaine**
+(`source4/dsdb/samdb/ldb_modules/samldb.c`). Windows stocke la référence
+vers un objet d'un domaine qu'il ne détient pas sous forme de phantom.
+Samba n'a pas de phantoms, mais un catalogue global détient une réplique
+partielle de chaque domaine de la forêt : un DC qui est GC trouve donc
+déjà l'utilisateur d'un autre domaine, et le lien garde son GUID et son
+SID (`extended_dn_store`), comme un lien vers un objet local. Il
+manquait les règles d'étendue des groupes d'Active Directory : un membre
+d'un autre domaine ne peut être ajouté qu'à un groupe universel ou de
+domaine local, et ne peut pas être lui-même un groupe de domaine local.
+`samldb` refuse désormais les autres cas (`LDB_ERR_UNWILLING_TO_PERFORM`).
+Le bouton « Parcourir » des outils Windows utilise le sélecteur d'objets,
+qui interroge le catalogue global : les objets des autres domaines y
+sont (pas encore testé avec un client Windows).
+
+**Groupes universels dans les jetons**
+(`source4/dsdb/common/util_groups.c`). Les groupes d'un utilisateur
+viennent des backlinks `memberOf` de son objet, y compris ceux des
+groupes d'un autre domaine présents dans une réplique partielle. Seuls
+les groupes universels d'un autre domaine s'appliquent en dehors de
+celui-ci : ses groupes globaux et de domaine local sont maintenant
+ignorés (et pas développés) lors de la construction du jeton. Le DC du
+domaine qui détient le groupe ajoute lui-même ses groupes de domaine
+local quand l'utilisateur arrive chez lui (referral Kerberos, relais
+NTLM).
+
+**Backlinks des répliques partielles**
+(`source4/dsdb/samdb/ldb_modules/repl_meta_data.c`). Quand un lien est
+répliqué avant sa cible (le `serverReference` d'un DC du domaine enfant
+arrive avec le NC Configuration, avant la réplique partielle du domaine
+enfant sur le GC du domaine parent), le backlink ne pouvait pas être
+ajouté, et ne l'était jamais par la suite. Windows garde un phantom pour
+cela. `repl_meta_data` enregistre maintenant ce backlink dans
+l'enregistrement `@REPLMD_PENDING_BACKLINKS` (GUID de la cible, attribut
+du backlink, DN étendu de la source) et l'ajoute à la fin de la
+transaction de réplication qui apporte la cible ; l'enregistrement est
+supprimé quand il est vide, et un lien retiré entre-temps retire son
+backlink en attente.
+
+**Catalogue global d'un domaine enfant** (`python/samba/kcc/__init__.py`,
+`source4/dsdb/common/util.c`, `source4/dsdb/pydsdb.c`, `lib/ldb/ldb_mdb/`,
+`source4/dsdb/samdb/ldb_modules/partition_init.c`). La tête de NC (non
+instanciée) d'une réplique partielle n'était créée qu'avec le crossRef
+d'un nouveau domaine : un GC d'un domaine enfant n'obtenait jamais le
+domaine racine, qui existait avant lui. Le KCC crée maintenant la tête
+de NC manquante à partir du crossRef (avec le GUID et le SID du NC)
+avant d'ajouter la réplique à `hasPartialReplicaNCs`. Comme rien n'est
+au-dessus du NC racine sur un DC enfant, `INSTANCE_TYPE_NC_ABOVE` n'est
+positionné que si nous détenons le NC du dessus. La base LMDB d'une
+partition créée à chaud utilisait la taille de map LMDB par défaut
+(1 Mio, `MDB_MAP_FULL` à la réplication du domaine racine) : elle reçoit
+maintenant les 8 Gio d'un provisionnement (espace d'adressage réservé
+seulement), et `lmdb_connect()` lit la taille de map dans les options de
+la connexion (celles de la partition) avant celles de l'ldb. Le KCC ne
+construit l'anneau intra-site d'un NC qu'avec ses répliques complètes en
+écriture : la réplique partielle d'un GC d'un autre domaine n'est pas
+une source.
+
+**Vérification du KCC** (`python/samba/kcc/__init__.py`). `samba_kcc
+--verify` (`samba.tests.kcc`) échouait sur `vampire_dc` et
+`promoted_dc` dès que la forêt avait un domaine enfant, selon le
+moment, pour deux raisons. Une fois que le KCC d'un DC du domaine parent
+(ils sont tous catalogues globaux) a ajouté la réplique partielle du
+domaine enfant, le graphe du NC du domaine enfant construit sur ce DC
+contient la réplique complète du DC enfant et les répliques partielles
+des GC, qui ne font que recevoir des arêtes : il est connexe, mais ce
+n'est pas l'anneau double qu'exigeait la vérification. L'anneau double
+n'est maintenant vérifié que si notre propre réplique est complète. Et
+avec quatre DC dans un site (trois DC du domaine parent et le DC
+enfant), le graphe des connexions vu par un DC n'est pas connexe tant
+que le KCC de tous les autres DC n'est pas passé et que leurs objets de
+connexion ne sont pas répliqués : les DSA qui n'ont encore aucune
+connexion (dans un sens ou dans l'autre) sont écartés de la vérification
+quand le site a plus de trois DC.
+
+**Partitions de la forêt sur un DC enfant** (`python/samba/join.py`). Le
+join d'un domaine enfant réplique maintenant la partition ForestDnsZones
+avec les NC Schema et Configuration (elle contient la zone `_msdcs` de
+la forêt), la liste dans le `msDS-hasMasterNCs` du nouveau DC et ajoute
+le nouveau DC au `msDS-NC-Replica-Locations` de son crossRef, pour que
+le KCC des autres DC la réplique avec le nouveau DC.
+
+**Netlogon** (`source4/rpc_server/netlogon/dcerpc_netlogon.c`).
+`DsrEnumerateDomainTrusts` ne listait que notre propre domaine et les
+objets trustedDomain, avec un `parent_index` toujours à 0. Il liste
+maintenant tous les domaines de la forêt, à partir des crossRefs du
+conteneur Partitions, fusionnés avec les objets trustedDomain de nos
+trusts directs : `IN_FOREST` et `NATIVE` pour tous, `TREEROOT` pour un
+domaine sans `trustParent`, `PRIMARY` pour notre domaine,
+`INBOUND`/`OUTBOUND` pour les trusts directs, et `parent_index` égal à
+l'indice du domaine parent dans la liste renvoyée ([MS-NRPC] 2.2.1.6.2).
+Les entrées sont filtrées selon les drapeaux demandés.
+`LogonGetDomainInfo` reçoit le nom DNS de la forêt, les mêmes drapeaux
+et le même indice de parent.
+
+**Filtrage de SID dans la forêt** (`source4/dsdb/common/util_trusts.c`,
+`source4/kdc/pac-glue.c`, `source4/auth/ntlm/auth_winbind.c`). Nouvelle
+fonction `dsdb_trust_filter_within_forest_sids()`, appliquée par le KDC
+au PAC d'un ticket émis par un autre domaine de la forêt, et à la
+réponse du relais NTLM pour un utilisateur d'un autre domaine de la
+forêt, selon [MS-PAC] 4.1.2.2 : avec un trust `WITHIN_FOREST`, les SID
+de la catégorie « AlwaysFilter » sont retirés (autorités Null, World,
+Local, Creator, SID bien connus et BUILTIN `S-1-5-x`, SID `S-1-5-21`
+partiels...) ; avec un trust en quarantaine
+(`TRUST_ATTRIBUTE_QUARANTINED_DOMAIN`), seuls passent les SID du domaine
+approuvé, Enterprise Domain Controllers et les SID « NeverFilter »
+(`S-1-5-15`, `S-1-5-1000-*`, `S-1-16-*`, `S-1-18-*`...). Si le SID de
+l'utilisateur ou de son groupe principal devait être retiré,
+l'authentification est refusée. Les trusts externes et de forêt gardent
+le filtrage qu'ils avaient.
+
+**Maître d'attribution des noms de domaine**
+(`source4/dsdb/samdb/ldb_modules/samldb.c`). `samldb` vérifie maintenant,
+à l'ajout et à la suppression d'un crossRef (hors provisionnement, et
+sauf avec le contrôle relax), que ce DC est le maître d'attribution des
+noms (`fSMORoleOwner` du conteneur Partitions, sinon
+`WERR_DS_INCORRECT_ROLE_OWNER`) ; qu'un nouveau crossRef de domaine a un
+`dnsRoot` et un nom NetBIOS ; qu'aucun autre crossRef n'a le même
+`dnsRoot` ou le même nom NetBIOS (`WERR_DS_CROSS_REF_EXISTS`) ; et qu'un
+crossRef de domaine supprimé n'a plus de DC (`msDS-HasDomainNCs` d'un
+objet nTDSDSA, `WERR_DS_NC_STILL_HAS_DSAS`). Le join d'un domaine enfant
+passait déjà par le maître d'attribution des noms avec `DsAddEntry` ; le
+transfert du rôle (`becomeDomainMaster`) existait déjà.
+
+**Maître d'infrastructure** (`python/samba/infrastructure.py`,
+`python/samba/netcmd/domain/infrastructure.py`, `python/samba/kcc/`).
+Sur un GC, les références vers les objets des autres domaines sont
+tenues à jour par la réplication de leur réplique partielle (Samba met
+déjà à jour ou retire les liens d'un objet renommé ou supprimé). Un DC
+qui n'est pas GC n'a rien pour les suivre. Le maître d'infrastructure du
+domaine (`fSMORoleOwner` de `CN=Infrastructure`) cherche maintenant,
+dans le catalogue global, la cible de chaque lien avant de son NC de
+domaine qui pointe vers un autre domaine de la forêt (par GUID, objets
+supprimés compris), et remplace la valeur quand la cible a été renommée
+ou déplacée, ou la retire quand la cible a été supprimée. La
+modification est une écriture d'origine, qui se réplique sur les autres
+DC du domaine. Le KCC la lance sur le maître d'infrastructure une fois
+par heure (quand la forêt a d'autres domaines), et `samba-tool domain
+infrastructure-update` la lance à la main.
+
+**dbcheck** (`python/samba/dbchecker.py`). Sur un GC d'un domaine
+enfant, la tête du NC de son domaine est sous la réplique partielle du
+domaine racine, arrivée après elle : que `INSTANCE_TYPE_NC_ABOVE` soit
+positionné ou non n'est pas une erreur.
+
+
 Limites connues
 ---------------
 
-- **Pas de phantoms :** Samba ne sait pas stocker une référence vers un
-  objet d'un NC qu'il ne détient pas. Les groupes de la racine sont
-  référencés dans le domaine enfant par des objets
-  `foreignSecurityPrincipal` (Windows utilise des phantoms). L'ajout d'un
-  utilisateur ou d'un groupe d'un domaine dans un groupe d'un autre
-  domaine de la forêt, les groupes universels des autres domaines dans
-  les jetons (via le GC) et le rôle de maître d'infrastructure ne sont ni
-  faits ni testés.
-- **Backlinks sur un catalogue global :** un lien répliqué avant la
-  réplique partielle de sa cible (par exemple le `serverReference` des
-  DC du domaine enfant, dans le NC Configuration) n'a pas de backlink
-  sur la copie de la cible dans la réplique partielle. `samba-tool
-  dbcheck` le signale.
-- **Netlogon :** `DsrEnumerateDomainTrusts` renvoie toujours
-  `parent_index = 0`.
-- **DNS :** la partition ForestDnsZones n'est pas répliquée sur le DC
-  enfant.
-- Le **filtrage de SID** à l'intérieur de la forêt n'a pas été revu.
+- **Pas de phantoms :** Samba ne sait toujours pas stocker une référence
+  vers un objet qu'il ne détient pas. Un membre d'un autre domaine ne
+  peut être ajouté que sur un DC qui détient sa réplique partielle,
+  c'est-à-dire un catalogue global (Windows crée un phantom sur
+  n'importe quel DC) ; sur un autre DC, l'objet est introuvable. Les
+  groupes Enterprise Admins et Schema Admins de la racine sont toujours
+  référencés dans les groupes d'un domaine enfant par des objets
+  `foreignSecurityPrincipal` (phase 2), car le join crée le domaine
+  enfant avant qu'il ne détienne le domaine racine.
+- **Groupes universels :** les groupes universels des autres domaines ne
+  sont dans les jetons que s'ils sont construits par un DC qui détient
+  leur réplique partielle (un catalogue global). Un DC qui n'est pas GC
+  ne les demande pas à un GC à l'ouverture de session, et la mise en
+  cache de l'appartenance aux groupes universels de Windows (pour les
+  sites sans GC) n'est pas implémentée.
+- **Backlinks en attente :** les backlinks qui attendent leur cible sont
+  gardés dans l'enregistrement local `@REPLMD_PENDING_BACKLINKS` de
+  chaque DC ; `dbcheck` ne le regarde pas, et un backlink dont la cible
+  n'arrive jamais y reste.
+- **Maître d'infrastructure :** écrit en Python et lancé par le KCC (au
+  plus une fois par heure par défaut), pas par le service de
+  réplication. Sur un DC qui n'est pas GC, il faut un autre GC joignable
+  en LDAP (port 3268). Seuls les liens avant du NC de domaine sont
+  vérifiés ; il ne fait rien sur un GC, déjà à jour (comme sous Windows,
+  le maître d'infrastructure ne devrait pas être un GC, sauf si tous les
+  DC du domaine le sont).
+- **Filtrage de SID :** seul le filtrage interne à la forêt a été
+  ajouté. Un trust `WITHIN_FOREST` n'est mis en quarantaine que si
+  `TRUST_ATTRIBUTE_QUARANTINED_DOMAIN` est positionné à la main sur son
+  objet trustedDomain. L'historique de SID des utilisateurs des autres
+  domaines de la forêt est conservé, comme sous Windows.
+- **Netlogon :** `DsrEnumerateDomainTrusts` et `LogonGetDomainInfo` ont
+  été revus ; les autres appels qui décrivent la forêt
+  (`DsrGetForestTrustInformation`, `DsrGetDcName` pour un autre domaine
+  de la forêt...) ne l'ont pas été.
+- **Maître d'attribution des noms de domaine :** en LDAP, le `nCName`
+  d'un nouveau crossRef doit déjà exister (c'est vérifié plus tôt, par
+  `extended_dn_store`) : les partitions d'application ne se créent pas
+  par un crossRef ajouté d'abord sur le maître d'attribution des noms.
+  Les contrôles sont ignorés pendant un provisionnement et avec le
+  contrôle relax.
+- **Vérification du KCC :** quand un site a plus de trois DC,
+  `samba_kcc --verify` écarte de la vérification du graphe les DSA qui
+  n'ont encore aucune connexion, et seule la connexité du graphe d'un NC
+  dont nous détenons une réplique partielle est vérifiée ; cela ne
+  change que la vérification, pas la topologie construite par le KCC.
 - Seuls une racine et un domaine enfant, avec un DC chacun, ont été
   testés : pas de petit-enfant ni de racine d'arborescence (referrals à
   travers plus d'un trust), pas de second DC ni de RODC dans le domaine
   enfant, pas de modification du schéma répliquée de la racine vers
   l'enfant.
 - Testé uniquement avec des DC Samba des deux côtés. Un domaine enfant
-  Samba sous une racine Windows, et l'inverse, ne sont pas testés.
-- **Catalogue global d'un domaine enfant :** un GC n'obtient que la
-  réplique partielle des domaines créés après son arrivée (la tête de NC
-  non instanciée arrive avec le crossRef du nouveau domaine). Un GC d'un
-  domaine enfant ne contient pas encore le domaine racine.
-- **Vérification du KCC :** `samba.tests.kcc` sur `promoted_dc` (un
-  troisième DC du domaine parent) échoue quand la forêt a un domaine
-  enfant : vu de ce DC, le graphe des objets de connexion du site n'est
-  pas connexe tant que le KCC des autres DC n'est pas passé. Il échouait
-  de la même façon (et aussi sur `vampire_dc`) avec le code de la
-  phase 1.
+  Samba sous une racine Windows, et l'inverse, ne sont pas testés, pas
+  plus que les outils d'administration Windows (sélecteur d'objets,
+  Utilisateurs et ordinateurs Active Directory) face à un domaine enfant
+  Samba.
 - `subdom_dc` n'est pas encore dans `script/autobuild.py`.
 
 
@@ -417,6 +673,30 @@ Modifications en détail
 | 27 | `selftest: replicate subdom_dc with its parent, test the cross-domain features` | `selftest/target/Samba4.pm`, `python/samba/tests/subdomain.py` | `setup_subdom_dc()` réplique le NC Configuration dans les deux sens. 8 nouveaux tests dans `samba.tests.subdomain` (Kerberos, NTLM, groupes et jeton de la racine, LSA, réplication, KCC, catalogue global). |
 
 
+### Phase 3
+
+| # | Commit | Fichiers | Quoi et pourquoi |
+|---|--------|----------|------------------|
+| 28 | `ldb:mdb: the options of the connection set the LMDB map size` | `lib/ldb/ldb_mdb/ldb_mdb.c` | `lmdb_connect()` ne lisait `lmdb_env_size` que dans les options de l'ldb, jamais dans celles passées à la connexion : le backend d'une partition ne pouvait pas avoir sa propre taille de map. Les options de la connexion passent maintenant en premier. |
+| 29 | `s4:dsdb:partition: a full LMDB map for the partitions created at runtime` | `source4/dsdb/samdb/ldb_modules/partition_init.c` | Une partition créée à chaud (une réplique partielle ajoutée par le KCC) recevait la taille de map LMDB par défaut, 1 Mio, et sa réplication échouait avec `MDB_MAP_FULL`. Elle reçoit maintenant les 8 Gio d'un provisionnement (espace d'adressage réservé), sauf si ses options fixent `lmdb_env_size`. |
+| 30 | `s4:dsdb: no NC_ABOVE on a partial replica with no NC above it` | `source4/dsdb/common/util.c` | `dsdb_create_partial_replica_NC()` positionnait toujours `INSTANCE_TYPE_NC_ABOVE`. La réplique partielle du domaine racine sur un GC d'un domaine enfant n'a rien au-dessus d'elle : le drapeau n'est maintenant positionné que si nous détenons le NC du dessus. |
+| 31 | `pydsdb: add _dsdb_create_partial_replica_NC()` | `source4/dsdb/pydsdb.c` | Liaison Python de `dsdb_create_partial_replica_NC()`, pour le KCC. |
+| 32 | `python:kcc: a global catalog of a child domain holds the forest root domain` | `python/samba/kcc/__init__.py` | `refresh_gc_partial_replicas()` crée la tête de NC manquante d'une réplique partielle à partir du crossRef du domaine (GUID et SID), au lieu d'ignorer les domaines qui existaient avant le GC (le domaine racine, vu d'un domaine enfant) ; un échec est journalisé et le NC ignoré. L'anneau intra-site d'un NC n'utilise que ses répliques complètes en écriture, pas la réplique partielle d'un GC d'un autre domaine. |
+| 33 | `python:kcc: fix the graph verification in a multi-domain forest` | `python/samba/kcc/__init__.py` | Quand notre réplique d'un NC est partielle, seule la connexité du graphe en écriture est vérifiée (les répliques partielles ne font que recevoir des arêtes, ce n'est pas un anneau double) ; avec plus de trois DC dans le site, les DSA qui n'ont encore aucune connexion (les résultats de leur KCC ne nous sont pas encore parvenus) sont écartés des vérifications du graphe de `--verify`. `samba.tests.kcc` échouait sur `vampire_dc` et `promoted_dc` dès que leur KCC avait ajouté la réplique partielle du domaine enfant. |
+| 34 | `s4:dsdb:repl_meta_data: add the backlinks of links replicated before their target` | `source4/dsdb/samdb/ldb_modules/repl_meta_data.c` | Un lien répliqué dont la cible n'est pas encore là (le `serverReference` d'un DC enfant sur le GC du domaine parent) n'avait jamais de backlink. Le backlink est maintenant noté dans `@REPLMD_PENDING_BACKLINKS` et ajouté quand la cible est répliquée (à la fin de cette transaction) ; `serverReferenceBL` était la seule erreur signalée par `dbcheck`. |
+| 35 | `samba-tool domain join: replicate ForestDnsZones to the DC of a new child domain` | `python/samba/join.py` | La partition ForestDnsZones appartient à toute la forêt : le join d'un domaine enfant la réplique, la liste dans `msDS-hasMasterNCs` et ajoute le nouveau DC au `msDS-NC-Replica-Locations` de son crossRef. |
+| 36 | `s4:dsdb:samldb: the group scope rules for the members of another domain` | `source4/dsdb/samdb/ldb_modules/samldb.c` | Un membre d'un autre domaine de la forêt (trouvé dans sa réplique partielle sur un GC) ne peut être ajouté qu'à un groupe universel ou de domaine local, et ne peut pas être lui-même un groupe de domaine local (`LDB_ERR_UNWILLING_TO_PERFORM`). |
+| 37 | `s4:dsdb:util_groups: only the universal groups of the other domains` | `source4/dsdb/common/util_groups.c` | `dsdb_expand_nested_groups()` ignore les groupes globaux et de domaine local d'un autre domaine (venant de `memberOf` sur un GC) : seuls ses groupes universels s'appliquent hors de celui-ci. Sans cela, le jeton d'un utilisateur du domaine enfant recevait les groupes de domaine local du domaine racine sur le DC enfant. |
+| 38 | `s4:dsdb:util_trusts: SID filtering of the intra-forest trusts` | `source4/dsdb/common/util_trusts.c`, `source4/dsdb/pydsdb.c`, `python/samba/tests/dsdb_trust_sid_filter.py` (nouveau), `selftest/tests.py` | Nouvelle fonction `dsdb_trust_filter_within_forest_sids()` ([MS-PAC] 4.1.2.2, `WithinForest` et `QuarantinedWithinForest`), sa liaison Python `_dsdb_trust_filter_within_forest_sids()` et 5 tests unitaires. |
+| 39 | `s4:kdc: filter the SIDs of a PAC issued by another domain of the forest` | `source4/kdc/pac-glue.c` | Le KDC applique le filtrage de SID interne à la forêt au PAC d'un ticket émis par un autre domaine de la forêt (`KRB5KDC_ERR_POLICY` si le SID de l'utilisateur ou de son groupe principal est filtré). |
+| 40 | `s4:auth:ntlm: filter the SIDs of the users of the other domains of the forest` | `source4/auth/ntlm/auth_winbind.c` | Le même filtrage pour la réponse du relais NTLM (winbindd) pour un utilisateur d'un autre domaine de la forêt. |
+| 41 | `s4:rpc_server:netlogon: list the domains of the forest with their parent` | `source4/rpc_server/netlogon/dcerpc_netlogon.c` | `DsrEnumerateDomainTrusts` liste tous les domaines de la forêt (crossRefs) fusionnés avec nos trusts directs, avec les drapeaux `IN_FOREST`, `NATIVE`, `TREEROOT`, `PRIMARY`, `INBOUND`/`OUTBOUND` et `parent_index` (toujours à 0 auparavant) ; `LogonGetDomainInfo` reçoit le nom de la forêt et les mêmes drapeaux. |
+| 42 | `s4:dsdb:samldb: crossRefs are added and deleted on the domain naming master` | `source4/dsdb/samdb/ldb_modules/samldb.c` | Ajout et suppression d'un crossRef uniquement sur le maître d'attribution des noms (`WERR_DS_INCORRECT_ROLE_OWNER`) ; `dnsRoot` et nom NetBIOS obligatoires pour un crossRef de domaine et uniques dans la forêt (`WERR_DS_CROSS_REF_EXISTS`) ; un crossRef de domaine ne peut pas être supprimé tant qu'un DC héberge le domaine (`WERR_DS_NC_STILL_HAS_DSAS`). |
+| 43 | `python: add the infrastructure master update` | `python/samba/infrastructure.py` (nouveau), `python/samba/netcmd/domain/infrastructure.py` (nouveau), `python/samba/netcmd/domain/__init__.py`, `docs-xml/manpages/samba-tool.8.xml` | `InfrastructureUpdate` cherche dans un GC les cibles des liens de notre NC de domaine vers les autres domaines de la forêt, et les met à jour (renommage, déplacement) ou les retire (suppression). `samba-tool domain infrastructure-update` la lance (`--dry-run`, `--gc`, `--force`), documentée dans la page de manuel de samba-tool. |
+| 44 | `python:kcc: run the infrastructure master update` | `python/samba/kcc/__init__.py` | Sur le maître d'infrastructure d'un domaine d'une forêt multi-domaines, le KCC lance la mise à jour au plus toutes les `kcc:infrastructure update interval` secondes (3600 par défaut), avec un GC trouvé dans la forêt si ce DC n'en est pas un. |
+| 45 | `python:dbcheck: NC_ABOVE below a partial replica is fine` | `python/samba/dbchecker.py` | Sur un GC d'un domaine enfant, la tête du NC de son domaine est sous la réplique partielle du domaine racine, arrivée après elle : `INSTANCE_TYPE_NC_ABOVE` positionné ou non n'est pas une erreur. |
+| 46 | `selftest: test the phase 3 multi-domain features` | `python/samba/tests/subdomain.py` | 8 nouveaux tests dans `samba.tests.subdomain`, voir [Tests](#tests). |
+
 Tests
 -----
 
@@ -434,9 +714,11 @@ Pour obtenir un shell dans l'environnement de test :
 SELFTEST_TESTENV=subdom_dc make testenv
 ```
 
-`samba.tests.subdomain` (`python/samba/tests/subdomain.py`) compte 14
-tests : les 6 de la phase 1 (état laissé par le join sur les deux DC) et
-8 pour la phase 2 :
+`samba.tests.subdomain` (`python/samba/tests/subdomain.py`) compte 22
+tests : les 6 de la phase 1 (état laissé par le join sur les deux DC),
+8 pour la phase 2 et 8 pour la phase 3.
+
+Phase 2 :
 
 | Test | Vérifie |
 |------|---------|
@@ -449,59 +731,93 @@ tests : les 6 de la phase 1 (état laissé par le join sur les deux DC) et
 | `test_kcc_cross_domain` | le KCC s'exécute sur les deux DC, et chacun a une connexion venant du DC de l'autre domaine |
 | `test_global_catalog` | le KCC du GC parent ajoute la réplique partielle du domaine enfant, qui se réplique, est instanciée et peut être interrogée sur le port 3268 |
 
-L'environnement `subdom_dc` réplique maintenant le NC Configuration
-dans les deux sens à son démarrage, comme les autres environnements de
-DC.
+Phase 3 :
 
-Résultats sur cette branche :
+| Test | Vérifie |
+|------|---------|
+| `test_forest_partitions_on_child` | le DC enfant détient les NC Schema, Configuration et ForestDnsZones (`namingContexts`, `msDS-hasMasterNCs`, emplacements de réplique du crossRef de ForestDnsZones), sert la zone `_msdcs` de la forêt, et ForestDnsZones se réplique dans les deux sens |
+| `test_child_global_catalog` | le KCC du DC enfant (un GC) ajoute la réplique partielle du domaine racine (`instanceType` 1 : tête de NC, rien au-dessus), et une recherche sur son port 3268 trouve l'Administrator des deux domaines |
+| `test_partial_replica_backlinks` | sur le GC du domaine parent, l'objet ordinateur du DC enfant a son `serverReferenceBL` |
+| `test_cross_domain_membership` | un utilisateur du domaine enfant dans un groupe universel et un groupe de domaine local du domaine racine (la référence porte son SID), refusé dans un groupe global ; l'utilisateur a le `memberOf` du groupe universel sur le GC |
+| `test_universal_groups_in_tokens` | le jeton de cet utilisateur, en Kerberos et en NTLM, contient le groupe universel sur les deux DC, et le groupe de domaine local uniquement sur le DC du domaine racine |
+| `test_netlogon_domain_trusts` | `DsrEnumerateDomainTrusts` sur les deux DC : les deux domaines, `IN_FOREST`, `NATIVE`, `TREEROOT` (racine seulement), `PRIMARY` (propre domaine seulement), `INBOUND`/`OUTBOUND`, SID, et `parent_index` du domaine enfant pointant vers la racine |
+| `test_domain_naming_master` | le crossRef du domaine enfant ne peut pas être supprimé, le DC enfant (pas maître d'attribution des noms) refuse un nouveau crossRef même à un Enterprise Admin, le maître refuse un `dnsRoot` en double, le rôle passe au DC enfant puis revient |
+| `test_infrastructure_update` | sur le DC parent, le maître d'infrastructure ne trouve rien à mettre à jour (c'est un GC) ; vu à travers un catalogue global où l'utilisateur du domaine enfant a été renommé, puis supprimé, les références des deux groupes sont mises à jour, puis retirées |
 
-- `samba.tests.subdomain` : 14/14 OK.
-- Aucune régression dans : `samba4.blackbox.trust_ntlm` (trust de forêt
-  `fl2008r2dc`, trust externe `fl2003dc`),
-  `samba4.blackbox.trust_utils(fl2008r2dc)`, `samba3.wbinfo_simple.trust`
-  (les 4 variantes sur `fl2008r2dc`), `samba.tests.dcerpc.lsa(ad_dc_default)`,
-  `samba4.rpc.lsalookup` (ncacn_np, seal, `ad_dc_ntvfs`),
-  `samba3.wbinfo_name_lookup(ad_member)`,
-  `samba.tests.krb5.kdc_tgs_tests(ad_dc)`,
-  `samba4.drs.replica_sync(vampire_dc)`, `samba4.drs.repl_rodc(ad_dc)`,
-  `samba4.blackbox.dbcheck` (`alpha13`, `release-4-1-6-partial-object`,
-  `release-4-5-0-pre1`, chacun avec `.quick`), `samba4.blackbox.dbcheck-links`,
+`samba.tests.dsdb_trust_sid_filter` (`python/samba/tests/dsdb_trust_sid_filter.py`,
+5 tests, sans environnement) vérifie le filtrage de SID des trusts
+internes à la forêt : ce qui passe un trust `WITHIN_FOREST` et un trust
+en quarantaine, les SID d'utilisateur et de groupe principal qui font
+échouer l'authentification, et que les autres trusts ne sont pas
+touchés.
+
+L'environnement `subdom_dc` réplique le NC Configuration dans les deux
+sens à son démarrage, comme les autres environnements de DC.
+
+Résultats sur cette branche (phase 3) :
+
+- `samba.tests.subdomain` : 22/22 OK ; `samba.tests.dsdb_trust_sid_filter` :
+  5/5 OK.
+- `samba-tool dbcheck --cross-ncs` après les réplications et les
+  passages du KCC : aucune erreur sur les deux DC.
+- Aucune régression dans : `samba.tests.provision`,
+  `samba.tests.dsdb(ad_dc_default)`, `samba4.blackbox.dbcheck`
+  (`alpha13`, `release-4-1-6-partial-object`, `release-4-5-0-pre1`,
+  chacun avec `.quick`), `samba4.blackbox.dbcheck-links`,
   `samba.tests.kcc.graph`, `.graph_utils`, `.ldif_import_export`,
-  `.kcc_utils(ad_dc_default)`, et `samba.tests.kcc` sur `vampire_dc` et
-  `promoted_dc` (voir [Limites connues](#limites-connues) pour
-  `promoted_dc` quand la forêt a un domaine enfant).
-- `samba4.blackbox.kinit_trust` (`fl2008r2dc`, `fl2003dc`) : tout est
-  OK sauf « check time with kerberos ccache », qui échoue dans cet
-  environnement de compilation parce que `samba-tool` y est lancé avec
-  un interpréteur Python sans module `ldb` ; cela ne dépend pas de cette
-  branche.
-- `samba-tool dbcheck --cross-ncs` après les réplications : aucune
-  erreur sur le DC enfant ; sur le DC parent, le backlink manquant décrit
-  dans [Limites connues](#limites-connues).
+  `samba3.wbinfo_name_lookup(ad_member)`, `samba4.rpc.lsalookup`
+  (ncacn_np, seal, `ad_dc_ntvfs`), `samba4.rpc.netlogon` et
+  `samba4.rpc.netlogon.admin` (ncacn_ip_tcp, seal, `ad_dc_ntvfs`),
+  `samba4.rpc.netlogon` (seal, `ad_dc`), `samba4.blackbox.trust_ntlm`
+  (trust de forêt `fl2008r2dc`, trust externe `fl2003dc`),
+  `samba4.blackbox.trust_utils(fl2008r2dc)`, `samba3.wbinfo_simple.trust`
+  (les 4 variantes sur `fl2008r2dc`), `samba.tests.dcerpc.lsa(ad_dc_default)`.
 - Avec le domaine enfant dans la forêt (`samba.tests.subdomain` lancé
-  en premier) : `samba4.blackbox.join_ldapcmp` (5 environnements) et
-  `samba4.drs.repl_secdesc`, `samba4.drs.repl_move`,
-  `samba4.drs.link_conflicts` sur `vampire_dc` : ALL OK.
-- Les autres tests de la phase 1 (provision, dsdb, sddl, descripteurs de
-  sécurité, upgradeprovision) n'ont pas été relancés, et la suite de
-  tests complète de Samba n'a pas été lancée.
+  en premier) : `samba4.urgent_replication(ad_dc)`,
+  `samba4.blackbox.join_ldapcmp` (5 environnements),
+  `samba4.drs.replica_sync`, `samba4.drs.repl_move` et
+  `samba4.drs.link_conflicts` sur `vampire_dc`,
+  `samba4.drs.repl_rodc(ad_dc)`, `samba.tests.krb5.kdc_tgs_tests(ad_dc)`,
+  `samba.tests.kcc.kcc_utils(ad_dc_default)`, et `samba.tests.kcc` sur
+  `vampire_dc` et `promoted_dc`, y compris après que leur KCC a ajouté
+  la réplique partielle du domaine enfant (il échouait à chaque fois dans
+  ce cas avant le commit 33) : ALL OK.
+- `samba4.blackbox.kinit_trust(fl2008r2dc)` : tout est OK sauf « check
+  time with kerberos ccache », qui échoue dans cet environnement de
+  compilation parce que `samba-tool` y est lancé avec un interpréteur
+  Python sans module `ldb` ; cela ne dépend pas de cette branche.
+- Les autres tests de la phase 1 (sddl, descripteurs de sécurité,
+  upgradeprovision) n'ont pas été relancés, et la suite de tests
+  complète de Samba n'a pas été lancée.
 
 
 Feuille de route
 ----------------
 
-1. **Références entre domaines :** phantoms (ou équivalent) pour les
-   membres d'un groupe qui appartiennent à un autre domaine, maître
-   d'infrastructure, groupes universels des autres domaines dans les
-   jetons.
-2. **Netlogon :** `parent_index` dans `DsrEnumerateDomainTrusts`, et
-   revue des autres appels qui listent les domaines de la forêt.
-3. **DNS :** ForestDnsZones sur les DC des domaines enfants.
-4. **Forêts plus grandes :** petits-enfants et racines d'arborescence
+Fait en phase 3 : membres venant d'un autre domaine (sur un GC), groupes
+universels des autres domaines dans les jetons, maître
+d'infrastructure, maître d'attribution des noms de domaine, catalogue
+global d'un domaine enfant, ForestDnsZones sur les DC enfants,
+`parent_index` et drapeaux de la forêt dans Netlogon, filtrage de SID
+dans la forêt, backlink manquant et vérification du KCC.
+
+1. **Références sans GC :** phantoms (ou équivalent) pour que n'importe
+   quel DC puisse stocker un membre d'un autre domaine ; recherche des
+   groupes universels auprès d'un GC à l'ouverture de session sur les DC
+   qui ne sont pas GC (et sa mise en cache) ; références directes à
+   Enterprise Admins et Schema Admins au lieu des objets
+   `foreignSecurityPrincipal`.
+2. **Netlogon :** revue des autres appels qui décrivent la forêt
+   (`DsrGetForestTrustInformation`, `DsrGetDcName` pour un autre
+   domaine).
+3. **Forêts plus grandes :** petits-enfants et racines d'arborescence
    (referrals à travers plusieurs trusts), plusieurs DC et RODC par
-   domaine, mises à jour du schéma.
-5. **Interopérabilité :** domaine enfant Samba sous une racine Windows et
-   l'inverse ; `subdom_dc` dans autobuild.
+   domaine, mises à jour du schéma, suppression d'un domaine enfant
+   (commande `samba-tool domain` pour supprimer son crossRef sur le
+   maître d'attribution des noms une fois son dernier DC parti).
+4. **Interopérabilité :** domaine enfant Samba sous une racine Windows et
+   l'inverse, outils d'administration Windows face à un domaine enfant
+   Samba ; `subdom_dc` dans autobuild.
 
 
 Soumission upstream
