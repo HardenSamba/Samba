@@ -824,6 +824,15 @@ static int replmd_process_backlink(struct ldb_module *module, struct la_backlink
 				      &bl->target_guid,
 				      attrs,
 				      parent);
+	if (ret != LDB_SUCCESS &&
+	    !dsdb_multi_domain_forest(ldb_module_get_ctx(module))) {
+		struct GUID_txt_buf guid_str;
+		DBG_WARNING("Failed to find target DN for linked attribute with GUID %s\n",
+			    GUID_buf_string(&bl->target_guid, &guid_str));
+		DBG_WARNING("Please run 'samba-tool dbcheck' to resolve any missing backlinks.\n");
+		talloc_free(frame);
+		return LDB_SUCCESS;
+	}
 	if (ret != LDB_SUCCESS) {
 		struct GUID_txt_buf guid_str;
 		const char *accept[] = { "GUID", "SID", NULL };
@@ -6071,7 +6080,7 @@ static int replmd_replicated_apply_add(struct replmd_replicated_request *ar)
 		return replmd_replicated_request_error(ar, ret);
 	}
 
-	{
+	if (dsdb_multi_domain_forest(ldb_module_get_ctx(ar->module))) {
 		/* see replmd_resolve_pending_backlinks() */
 		struct GUID *guids = NULL;
 
@@ -6613,6 +6622,10 @@ static bool replmd_instantiate_nc_head(struct replmd_replicated_request *ar,
 	char *s = NULL;
 
 	if (!(ar->objs->dsdb_repl_flags & DSDB_REPL_FLAG_PARTIAL_REPLICA)) {
+		return false;
+	}
+
+	if (!dsdb_multi_domain_forest(ldb_module_get_ctx(ar->module))) {
 		return false;
 	}
 

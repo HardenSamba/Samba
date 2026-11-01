@@ -107,10 +107,15 @@ static void dreplsrv_periodic_run(struct dreplsrv_service *service)
 	 * i.e. repsFrom/repsTo
 	 */
 	/*
-	 * dreplsrv_load_partitions() also picks up the NCs the KCC
-	 * added since (it refreshes the existing ones too)
+	 * In a multi-domain forest, dreplsrv_load_partitions() also
+	 * picks up the NCs the KCC added since (it refreshes the
+	 * existing ones too)
 	 */
-	dreplsrv_load_partitions(service);
+	if (dsdb_lp_multi_domain_forest(service->task->lp_ctx)) {
+		dreplsrv_load_partitions(service);
+	} else {
+		dreplsrv_refresh_partitions(service);
+	}
 
 	mem_ctx = talloc_new(service);
 	dreplsrv_schedule_pull_replication(service, mem_ctx);

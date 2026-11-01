@@ -120,7 +120,13 @@ struct descriptor_context {
  */
 static const struct dom_sid *descriptor_forest_sid(struct ldb_context *ldb)
 {
-	const struct dom_sid *forest_sid = samdb_forest_root_domain_sid(ldb);
+	const struct dom_sid *forest_sid = NULL;
+
+	if (!dsdb_multi_domain_forest(ldb)) {
+		return samdb_domain_sid(ldb);
+	}
+
+	forest_sid = samdb_forest_root_domain_sid(ldb);
 
 	if (forest_sid == NULL) {
 		forest_sid = samdb_domain_sid(ldb);

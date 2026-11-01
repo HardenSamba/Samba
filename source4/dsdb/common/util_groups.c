@@ -169,7 +169,8 @@ NTSTATUS dsdb_expand_nested_groups(struct ldb_context *sam_ctx,
 		 * group: its global and domain local groups only apply
 		 * in that domain, its DCs add them themselves.
 		 */
-		if (!(group_type & GROUP_TYPE_UNIVERSAL_GROUP)) {
+		if (!(group_type & GROUP_TYPE_UNIVERSAL_GROUP) &&
+		    dsdb_multi_domain_forest(sam_ctx)) {
 			const struct dom_sid *domain_sid =
 				samdb_domain_sid(sam_ctx);
 

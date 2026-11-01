@@ -830,9 +830,18 @@ sub provision_raw_step1($$)
 
 ";
 
+	# The forest of ad_dc_ntvfs gets a child domain (subdom_dc): its
+	# DCs need the (Harden-Box) multi-domain forest support
+	my $harden_options = "";
+	if ($ctx->{realm} eq "SAMBA.EXAMPLE.COM" or
+	    $ctx->{realm} eq "SUB.SAMBA.EXAMPLE.COM") {
+		$harden_options = "harden:multi-domain forest = yes";
+	}
+
 	print CONFFILE "
 
 	# Begin extra options
+	$harden_options
 	$ctx->{smb_conf_extra_options}
 	# End extra options
 ";

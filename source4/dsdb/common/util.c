@@ -1473,6 +1473,30 @@ const struct dom_sid *samdb_domain_sid_cache_only(struct ldb_context *ldb)
 }
 
 /*
+  Is the support of multi-domain forests enabled
+  ("harden:multi-domain forest = yes" in smb.conf)?
+
+  It is off by default: the DC then behaves as an upstream Samba DC,
+  which only supports single-domain forests.
+*/
+bool dsdb_lp_multi_domain_forest(struct loadparm_context *lp_ctx)
+{
+	if (lp_ctx == NULL) {
+		return false;
+	}
+	return lpcfg_parm_bool(lp_ctx, NULL, "harden", "multi-domain forest",
+			       false);
+}
+
+bool dsdb_multi_domain_forest(struct ldb_context *ldb)
+{
+	struct loadparm_context *lp_ctx = talloc_get_type(
+		ldb_get_opaque(ldb, "loadparm"), struct loadparm_context);
+
+	return dsdb_lp_multi_domain_forest(lp_ctx);
+}
+
+/*
   get the SID of the forest root domain.
 
   In the forest root domain this is our own domain SID. In a child
@@ -6109,6 +6133,7 @@ int dsdb_validate_dsa_guid(struct ldb_context *ldb,
 
 	account_dn = ldb_msg_find_attr_as_dn(ldb, tmp_ctx, msg, "serverReference");
 	if (account_dn == NULL &&
+	    dsdb_multi_domain_forest(ldb) &&
 	    dsdb_validate_dsa_guid_other_domain(ldb, tmp_ctx, dsa_guid, sid)) {
 		talloc_free(tmp_ctx);
 		return LDB_SUCCESS;
@@ -6461,9 +6486,10 @@ int dsdb_create_partial_replica_NC(struct ldb_context *ldb,  struct ldb_dn *dn)
 
 		instance_type = INSTANCE_TYPE_IS_NC_HEAD |
 				INSTANCE_TYPE_UNINSTANT;
-		if (parent_dn != NULL &&
-		    dsdb_find_nc_root(ldb, tmp_ctx, parent_dn,
-				      &above_nc) == LDB_SUCCESS)
+		if (!dsdb_multi_domain_forest(ldb) ||
+		    (parent_dn != NULL &&
+		     dsdb_find_nc_root(ldb, tmp_ctx, parent_dn,
+				       &above_nc) == LDB_SUCCESS))
 		{
 			instance_type |= INSTANCE_TYPE_NC_ABOVE;
 		}
@@ -6483,7 +6509,7 @@ int dsdb_create_partial_replica_NC(struct ldb_context *ldb,  struct ldb_dn *dn)
 	 * dsdb_trust_parse_crossref_info()) knows the SID of the
 	 * domain before its NC is replicated to us.
 	 */
-	{
+	if (dsdb_multi_domain_forest(ldb)) {
 		const struct ldb_val *guid_val = NULL;
 		struct dom_sid sid;
 		NTSTATUS status;
@@ -7013,7 +7039,7 @@ bool dsdb_objects_have_same_nc(struct ldb_context *ldb,
 	}
 
 	ret = dsdb_find_nc_root(ldb, tmp_ctx, target_dn, &target_nc);
-	if (ret == LDB_ERR_NO_SUCH_OBJECT) {
+	if (ret == LDB_ERR_NO_SUCH_OBJECT && dsdb_multi_domain_forest(ldb)) {
 		/*
 		 * The target is not in any NC we hold, e.g. it is in
 		 * the domain NC of another domain of our forest

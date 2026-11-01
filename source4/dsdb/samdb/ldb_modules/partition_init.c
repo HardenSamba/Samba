@@ -269,7 +269,7 @@ static int new_partition_from_dn(struct ldb_context *ldb, struct partition_priva
 	ctrl->dn = talloc_steal(ctrl, dn);
 	
 	options = ldb_options_get(ldb);
-	if (create) {
+	if (create && dsdb_multi_domain_forest(ldb)) {
 		/*
 		 * The sam.ldb of a running DC is opened with
 		 * LDB_FLG_DONT_CREATE_DB, but a partition created at

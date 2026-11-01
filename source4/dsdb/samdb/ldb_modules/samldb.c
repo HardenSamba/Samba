@@ -3423,7 +3423,7 @@ static int samldb_member_check_other_domain(struct samldb_ctx *ac,
 	struct dom_sid member_domain;
 	uint32_t member_group_type;
 
-	if (our_sid == NULL) {
+	if (our_sid == NULL || !dsdb_multi_domain_forest(ldb)) {
 		return LDB_SUCCESS;
 	}
 	if (samdb_find_attribute(ldb, member, "objectClass",
@@ -4984,6 +4984,9 @@ static int samldb_naming_master_check(struct samldb_ctx *ac)
 
 static bool samldb_skip_naming_master_checks(struct samldb_ctx *ac)
 {
+	if (!dsdb_multi_domain_forest(ldb_module_get_ctx(ac->module))) {
+		return true;
+	}
 	if (ldb_request_get_control(ac->req, LDB_CONTROL_PROVISION_OID)) {
 		return true;
 	}

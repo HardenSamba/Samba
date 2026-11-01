@@ -263,7 +263,8 @@ static NTSTATUS drepl_replica_sync(struct irpc_message *msg,
 	werr = dreplsrv_partition_find_for_nc(service,
 	                                      &nc->guid, &nc->sid, nc->dn,
 	                                      &p);
-	if (W_ERROR_EQUAL(werr, WERR_DS_DRA_BAD_NC)) {
+	if (W_ERROR_EQUAL(werr, WERR_DS_DRA_BAD_NC) &&
+	    dsdb_lp_multi_domain_forest(service->task->lp_ctx)) {
 		/*
 		 * The KCC may just have added a NC (e.g. a partial
 		 * replica of another domain of our forest on a global

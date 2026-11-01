@@ -308,7 +308,8 @@ static int fix_one_way_link(struct extended_search_context *ac, struct ldb_dn *d
 		   domain of our forest), we show the stored DN, as
 		   Windows does with its phantoms.
 		*/
-		if (!dn_in_local_nc(ac, dn)) {
+		if (dsdb_multi_domain_forest(ldb_module_get_ctx(ac->module)) &&
+		    !dn_in_local_nc(ac, dn)) {
 			talloc_free(tmp_ctx);
 			return LDB_SUCCESS;
 		}
