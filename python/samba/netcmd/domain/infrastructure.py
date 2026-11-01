@@ -18,6 +18,7 @@
 
 import samba.getopt as options
 from samba.auth import system_session
+from samba.harden import MULTI_DOMAIN_FOREST, multi_domain_forest
 from samba.infrastructure import InfrastructureUpdate
 from samba.netcmd import Command, CommandError, Option
 from samba.samdb import SamDB
@@ -36,7 +37,11 @@ deleted, like the infrastructure master of the domain does
 periodically (from the KCC).
 
 By default, this only runs on the infrastructure master of the domain
-(see 'samba-tool fsmo show').
+(see 'samba-tool fsmo show'). As on Windows, the role does nothing on a
+DC that is a global catalog (its references are kept up to date by the
+replication of the partial replicas): the infrastructure master should
+be a DC that is not a global catalog, unless every DC of the domain is
+one. This needs 'harden:multi-domain forest = yes'.
 """
     synopsis = "%prog [options]"
 
@@ -44,8 +49,8 @@ By default, this only runs on the infrastructure master of the domain
         Option("-H", "--URL", help="LDB URL for database or target server",
                type=str, metavar="URL", dest="H"),
         Option("--gc", help="LDB URL of the global catalog to use "
-               "(default: this DC if it is a global catalog, else another "
-               "global catalog of the forest)", type=str, metavar="URL"),
+               "(default: a global catalog of the forest)", type=str,
+               metavar="URL"),
         Option("--dry-run", help="Only show what would be changed",
                action="store_true", default=False),
         Option("--force", help="Run even if the DC is not the "
@@ -61,6 +66,11 @@ By default, this only runs on the infrastructure master of the domain
     def run(self, H=None, gc=None, dry_run=False, force=False,
             sambaopts=None, credopts=None, versionopts=None):
         lp = sambaopts.get_loadparm()
+        if not multi_domain_forest(lp):
+            raise CommandError("The infrastructure master update is part "
+                               "of the multi-domain forest support: set "
+                               "'%s = yes' in smb.conf" %
+                               MULTI_DOMAIN_FOREST)
         creds = credopts.get_credentials(lp)
         samdb = SamDB(url=H, session_info=system_session(),
                       credentials=creds, lp=lp)
@@ -74,7 +84,15 @@ By default, this only runs on the infrastructure master of the domain
             raise CommandError("This DC is not the infrastructure master "
                                "of its domain (use --force to run anyway)")
 
-        if gc_samdb is None and not infra.is_gc():
+        if infra.is_gc():
+            # As on Windows, the role does nothing on a global catalog
+            infra.gc_disabled_reason()
+            self.outf.write("This DC is a global catalog: the "
+                            "infrastructure master role does nothing "
+                            "here.\n")
+            return
+
+        if gc_samdb is None:
             # we need the partial replicas of the other domains
             for name in infra.find_gc():
                 try:

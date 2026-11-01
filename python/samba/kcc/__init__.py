@@ -441,19 +441,23 @@ class KCC(object):
             with open(stamp, "w"):
                 pass
 
-            if not infra.is_gc():
-                # the partial replicas of the other domains are on
-                # the global catalogs
-                for name in infra.find_gc():
-                    try:
-                        infra.gc = SamDB(url="ldap://%s:3268" % name,
-                                         session_info=system_session(),
-                                         credentials=creds, lp=lp)
-                        break
-                    except ldb.LdbError as e:
-                        logger.warning("Global catalog %s: %s" % (name, e))
-                else:
-                    return
+            if infra.is_gc():
+                # As on Windows, the role does nothing on a GC
+                infra.gc_disabled_reason()
+                return
+
+            # the partial replicas of the other domains are on the
+            # global catalogs
+            for name in infra.find_gc():
+                try:
+                    infra.gc = SamDB(url="ldap://%s:3268" % name,
+                                     session_info=system_session(),
+                                     credentials=creds, lp=lp)
+                    break
+                except ldb.LdbError as e:
+                    logger.warning("Global catalog %s: %s" % (name, e))
+            else:
+                return
 
             changes = infra.run(fix=True)
             DEBUG_FN("infrastructure update: %d references updated" %

@@ -766,7 +766,7 @@ class SubdomainTests(TestCase):
         infra = InfrastructureUpdate(self.parent, self._logger())
         self.assertTrue(infra.is_infrastructure_master())
         # the parent DC is a GC: the references are already up to date
-        self.assertEqual(infra.run(fix=False), [])
+        self.assertEqual(infra.run(fix=False, ignore_gc=True), [])
 
         # as seen from a DC that is not a GC: the GC tells that the user
         # was renamed, then deleted
@@ -786,7 +786,7 @@ class SubdomainTests(TestCase):
                 return [msg]
 
         infra.gc = FakeGC()
-        changes = [c for c in infra.run(fix=False)
+        changes = [c for c in infra.run(fix=False, ignore_gc=True)
                    if str(c[0]).lower() in (str(univ_dn).lower(),
                                             str(local_dn).lower())]
         self.assertEqual(len(changes), 2)
@@ -795,10 +795,48 @@ class SubdomainTests(TestCase):
             self.assertIn(str(renamed), new)
 
         infra.gc.deleted = True
-        changes = [c for c in infra.run(fix=False)
+        changes = [c for c in infra.run(fix=False, ignore_gc=True)
                    if str(c[0]).lower() == str(univ_dn).lower()]
         self.assertEqual(len(changes), 1)
         self.assertIsNone(changes[0][3])
+
+        # As on Windows, the role does nothing on a global catalog,
+        # even with a GC that knows about the rename
+        self.assertTrue(infra.is_gc())
+        self.assertEqual(infra.run(fix=False), [])
+
+    def test_infrastructure_master_on_gc(self):
+        """As on Windows, the infrastructure master role does nothing on
+        a global catalog: it says so, and asks to move the role when a DC
+        of the domain is not a GC"""
+        import logging
+
+        class Records(logging.Handler):
+            def __init__(self):
+                super().__init__()
+                self.records = []
+
+            def emit(self, record):
+                self.records.append(record)
+
+        logger = logging.getLogger("subdomain-infra-gc")
+        logger.setLevel(logging.DEBUG)
+        handler = Records()
+        logger.addHandler(handler)
+        self.addCleanup(logger.removeHandler, handler)
+
+        infra = InfrastructureUpdate(self.parent, logger)
+        self.assertTrue(infra.is_gc())
+        self.assertEqual(infra.run(fix=True), [])
+        self.assertTrue(handler.records)
+        not_gc = infra.domain_dcs_not_gc()
+        warnings = [r for r in handler.records
+                    if r.levelno == logging.WARNING]
+        if not_gc:
+            self.assertTrue(warnings)
+            self.assertIn("global catalog", warnings[0].getMessage())
+        else:
+            self.assertFalse(warnings)
 
     def _logger(self):
         import logging

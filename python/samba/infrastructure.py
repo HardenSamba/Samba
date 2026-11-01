@@ -38,12 +38,20 @@ DC, or another GC) and updates the references of its domain NC:
 - the target is deleted: the value is removed.
 
 A target that the global catalog doesn't know (yet) is left alone.
+
+As on Windows, the role does nothing on a DC that is a global catalog:
+a GC holds the partial replica of every other domain, its references
+are kept up to date by the replication, and it has no phantoms to
+check. When some DCs of the domain are not GCs, the infrastructure
+master must not be a GC (a warning says so); when they all are, the
+role has nothing to do.
 """
 
 import ldb
 from samba import dsdb
 from samba.ndr import ndr_unpack
 from samba.dcerpc import misc, security
+from samba.samdb import dsdb_dn_guess
 
 
 class InfrastructureUpdate(object):
@@ -88,6 +96,37 @@ class InfrastructureUpdate(object):
             if len(server) == 1 and "dNSHostName" in server[0]:
                 names.append(str(server[0]["dNSHostName"][0]))
         return names
+
+    def domain_dcs_not_gc(self):
+        """The nTDSDSA objects of the DCs of our domain that are not
+        global catalogs"""
+        res = self.samdb.search(base=self.samdb.get_config_basedn(),
+                                scope=ldb.SCOPE_SUBTREE,
+                                expression="(&(objectClass=nTDSDSA)"
+                                "(msDS-HasDomainNCs=%s)"
+                                "(!(options:1.2.840.113556.1.4.803:=%u)))" %
+                                (ldb.binary_encode(str(self.domain_dn)),
+                                 dsdb.DS_NTDSDSA_OPT_IS_GC),
+                                attrs=[])
+        return [msg.dn for msg in res]
+
+    def gc_disabled_reason(self):
+        """Log why the role does nothing on this DC, a global catalog"""
+        others = self.domain_dcs_not_gc()
+        if others:
+            self.logger.warning(
+                "This DC is the infrastructure master and a global "
+                "catalog: as on Windows, the infrastructure master role "
+                "does nothing on a global catalog, and the references of "
+                "the DCs that are not global catalogs (%s) to the other "
+                "domains of the forest are not updated. Transfer the "
+                "role to one of them (samba-tool fsmo transfer "
+                "--role=infrastructure), or make them global catalogs." %
+                ", ".join(str(dn.parent().get_rdn_value()) for dn in others))
+        else:
+            self.logger.info("This DC is a global catalog, like every DC "
+                             "of the domain: the infrastructure master role "
+                             "has nothing to do.")
 
     def is_infrastructure_master(self):
         """Is the DC of samdb the infrastructure master of its domain?"""
@@ -167,13 +206,20 @@ class InfrastructureUpdate(object):
         deleted = str(res[0].get("isDeleted", idx=0)).upper() == "TRUE"
         return (res[0].dn, sid, deleted)
 
-    def run(self, fix=True):
+    def run(self, fix=True, ignore_gc=False):
         """Check (and fix, if fix is True) the references of our domain
         NC to the other domains of the forest.
+
+        Nothing is done on a global catalog (see gc_disabled_reason()),
+        unless ignore_gc is True (for the tests).
 
         :return: a list of (object dn, attribute, old value, new value)
             tuples, new value being None for a removed reference
         """
+        if not ignore_gc and self.is_gc():
+            self.gc_disabled_reason()
+            return []
+
         other_ncs = self.other_domain_ncs()
         if not other_ncs:
             return []
@@ -209,7 +255,10 @@ class InfrastructureUpdate(object):
         return changes
 
     def _check_value(self, dn, attr, value, other_ncs):
-        target = ldb.Dn(self.samdb, value)
+        # DN, DN-Binary ("B:...", msDS-RevealedUsers of a RODC...) or
+        # DN-String
+        dsdb_dn = dsdb_dn_guess(self.samdb, value)
+        target = dsdb_dn.dn
         if not self._in_other_domain(target, other_ncs):
             return None
 
@@ -233,7 +282,7 @@ class InfrastructureUpdate(object):
         if cur_dn == ldb.Dn(self.samdb, str(target)) and old_sid == cur_sid:
             return None
 
-        new = "<GUID=%s>" % guid
+        new = "%s<GUID=%s>" % (dsdb_dn.prefix, guid)
         if cur_sid is not None:
             new += ";<SID=%s>" % cur_sid
         new += ";%s" % cur_dn

@@ -2070,7 +2070,9 @@ The <constant>--verbose</constant> includes more, probably useless, information.
 	targets of these references up in the global catalog, updates the
 	references whose target was renamed or moved, and removes those whose
 	target was deleted. By default, it only runs on the infrastructure
-	master of the domain.</para>
+	master of the domain. As on Windows, the role does nothing on a DC
+	that is a global catalog. This needs
+	<literal>harden:multi-domain forest = yes</literal>.</para>
 	<variablelist>
 	  <varlistentry>
 	    <term>-H URL, --URL=URL</term>
@@ -2078,9 +2080,8 @@ The <constant>--verbose</constant> includes more, probably useless, information.
 	  </varlistentry>
 	  <varlistentry>
 	    <term>--gc=URL</term>
-	    <listitem><para>LDB URL of the global catalog to use (default: this
-	    DC if it is a global catalog, else another global catalog of the
-	    forest)</para></listitem>
+	    <listitem><para>LDB URL of the global catalog to use (default: a
+	    global catalog of the forest)</para></listitem>
 	  </varlistentry>
 	  <varlistentry>
 	    <term>--dry-run</term>
