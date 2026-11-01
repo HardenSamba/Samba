@@ -2318,6 +2318,19 @@ newSuperior: %s""" % (str(from_dn), str(to_rdn), str(to_base)))
 
         return False
 
+    def nc_above_is_partial_replica(self, obj, calculated_instancetype):
+        """The NC head of the domain of a GC of a child domain, below the
+        partial replica of the forest root domain the GC got after it:
+        INSTANCE_TYPE_NC_ABOVE may or may not be set"""
+        if len(obj["instanceType"]) != 1:
+            return False
+        diff = int(obj["instanceType"][0]) ^ calculated_instancetype
+        if diff != dsdb.INSTANCE_TYPE_NC_ABOVE:
+            return False
+        if not calculated_instancetype & dsdb.INSTANCE_TYPE_IS_NC_HEAD:
+            return False
+        return self.is_in_partial_nc(obj.dn.parent())
+
     def is_in_partial_nc(self, dn):
         """Is dn in a partial (global catalog) replica of a domain NC?"""
         if not self.partial_ncs:
@@ -2957,6 +2970,8 @@ newSuperior: %s""" % (str(from_dn), str(to_rdn), str(to_base)))
             if attrname.lower() == "instancetype":
                 calculated_instancetype = self.calculate_instancetype(dn)
                 if len(obj["instanceType"]) != 1 or int(obj["instanceType"][0]) != calculated_instancetype:
+                    if self.nc_above_is_partial_replica(obj, calculated_instancetype):
+                        continue
                     error_count += 1
                     self.err_wrong_instancetype(obj, calculated_instancetype)
 
