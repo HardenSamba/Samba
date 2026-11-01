@@ -145,7 +145,16 @@ interface dnsp
 		DSPROPERTY_ZONE_SCAVENGING_SERVERS_DA   = 0x90,
 		DSPROPERTY_ZONE_MASTER_SERVERS_DA       = 0x91,
 		DSPROPERTY_ZONE_NS_SERVERS_DA           = 0x92,
-		DSPROPERTY_ZONE_NODE_DBFLAGS			= 0x100
+		DSPROPERTY_ZONE_NODE_DBFLAGS			= 0x100,
+		/*
+		 * Samba (Harden-Box) specific: the forwarder timeout
+		 * and "do not use recursion" of a conditional forwarder
+		 * stored in AD, which [MS-DNSP] 2.3.2.1 does not
+		 * define. Only written when they differ from the
+		 * defaults (5 seconds, recursion allowed).
+		 */
+		DSPROPERTY_ZONE_SAMBA_FORWARDER_TIMEOUT	= 0x0000FF01,
+		DSPROPERTY_ZONE_SAMBA_FORWARDER_SLAVE	= 0x0000FF02
 
 	} dns_property_id;
 
@@ -262,6 +271,8 @@ interface dnsp
 		[case(DSPROPERTY_ZONE_MASTER_SERVERS_DA)]		dnsp_dns_addr_array z_master_servers;
 		[case(DSPROPERTY_ZONE_NS_SERVERS_DA)]			dnsp_dns_addr_array d_ns_servers;
 		[case(DSPROPERTY_ZONE_NODE_DBFLAGS)]			dns_rpc_node_flags flags;
+		[case(DSPROPERTY_ZONE_SAMBA_FORWARDER_TIMEOUT)]	uint32 forwarder_timeout;
+		[case(DSPROPERTY_ZONE_SAMBA_FORWARDER_SLAVE)]	uint32 forwarder_slave;
 	} dnsPropertyData;
 
 	/* this is the format for the dnsProperty attribute in the DNS

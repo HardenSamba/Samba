@@ -902,6 +902,8 @@ bool dns_zoneinfo_load_zone_property(struct dnsserver_zoneinfo *zoneinfo,
 	case DSPROPERTY_ZONE_MASTER_SERVERS_DA:
 	case DSPROPERTY_ZONE_NS_SERVERS_DA:
 	case DSPROPERTY_ZONE_NODE_DBFLAGS:
+	case DSPROPERTY_ZONE_SAMBA_FORWARDER_TIMEOUT:
+	case DSPROPERTY_ZONE_SAMBA_FORWARDER_SLAVE:
 		break;
 	}
 	return true;
