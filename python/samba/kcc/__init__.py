@@ -2349,8 +2349,15 @@ class KCC(object):
                                   if not self.get_dsa(x).is_ro())
             rw_dot_edges = [(a, b) for a, b in dot_edges if
                             a in rw_dot_vertices and b in rw_dot_vertices]
-            rw_verify_properties = ('connected',
-                                    'directed_double_ring_or_small')
+            # The full replicas form a double ring. When our replica
+            # is partial (we are a GC and NC (x) is another domain),
+            # R also has the partial replicas, which only get edges
+            # from the others: connected, but not a double ring.
+            if partial:
+                rw_verify_properties = ('connected',)
+            else:
+                rw_verify_properties = ('connected',
+                                        'directed_double_ring_or_small')
             verify_and_dot('intrasite_rw_pre_ntdscon', rw_dot_edges,
                            rw_dot_vertices,
                            label='%s__%s__%s' % (site_local.site_dnstr,
@@ -2449,8 +2456,15 @@ class KCC(object):
                                   if not self.get_dsa(x).is_ro())
             rw_dot_edges = [(a, b) for a, b in dot_edges if
                             a in rw_dot_vertices and b in rw_dot_vertices]
-            rw_verify_properties = ('connected',
-                                    'directed_double_ring_or_small')
+            # The full replicas form a double ring. When our replica
+            # is partial (we are a GC and NC (x) is another domain),
+            # R also has the partial replicas, which only get edges
+            # from the others: connected, but not a double ring.
+            if partial:
+                rw_verify_properties = ('connected',)
+            else:
+                rw_verify_properties = ('connected',
+                                        'directed_double_ring_or_small')
             verify_and_dot('intrasite_rw_post_ntdscon', rw_dot_edges,
                            rw_dot_vertices,
                            label='%s__%s__%s' % (site_local.site_dnstr,
@@ -2614,6 +2628,26 @@ class KCC(object):
                 else:
                     edge_colours.append('blue')
                 dot_edges.append((con.from_dnstr, dsa.dsa_dnstr))
+
+        if verify:
+            # A DSA with no connection at all, in either direction, is
+            # one whose KCC results have not reached us yet (its own
+            # inbound connections are created by its KCC): with more
+            # than three DCs in the site, nothing in our view connects
+            # it yet. Leave it out of the verification.
+            connected = set()
+            for (a, b) in dot_edges:
+                connected.add(a)
+                connected.add(b)
+            unknown = [v for v in dot_vertices
+                       if v not in connected and v != self.my_dsa_dnstr]
+            if unknown and len(dot_vertices) > 3:
+                DEBUG_FN("not verifying %s: no connection known yet" %
+                         unknown)
+                keep = [i for i, v in enumerate(dot_vertices)
+                        if v not in unknown]
+                dot_vertices = [dot_vertices[i] for i in keep]
+                vertex_colours = [vertex_colours[i] for i in keep]
 
         verify_and_dot(basename, dot_edges, vertices=dot_vertices,
                        label=self.my_dsa_dnstr,
