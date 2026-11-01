@@ -27,14 +27,14 @@ from samba import unix2nttime, nttime2unix
 from samba import ldb, dsdb, drs_utils
 from samba.auth import system_session
 from samba.samdb import SamDB
-from samba.dcerpc import drsuapi, misc
+from samba.dcerpc import drsuapi, misc, security
 
 from samba.kcc.kcc_utils import Site, Partition, Transport, SiteLink
 from samba.kcc.kcc_utils import NCReplica, NCType, nctype_lut, GraphNode
 from samba.kcc.kcc_utils import RepsFromTo, KCCError, KCCFailedObject
 from samba.kcc.graph import convert_schedule_to_repltimes
 
-from samba.ndr import ndr_pack
+from samba.ndr import ndr_pack, ndr_unpack
 
 from samba.kcc.graph_utils import verify_and_dot
 
@@ -368,21 +368,6 @@ class KCC(object):
         for dnstr in sorted(wanted):
             if dnstr.lower() in held:
                 continue
-            # The (uninstantiated) NC head of the partial replica is
-            # created with the crossRef of a new domain, when it is
-            # added or replicated to us. A domain that existed before
-            # this DC (e.g. the forest root, seen from a GC of a child
-            # domain) has none, and we can't add the replica yet.
-            try:
-                self.samdb.search(base=dnstr, scope=ldb.SCOPE_BASE,
-                                  attrs=["instanceType"])
-            except ldb.LdbError as e:
-                (enum, estr) = e.args
-                if enum != ldb.ERR_NO_SUCH_OBJECT:
-                    raise
-                DEBUG_FN("No NC head for the partial replica of %s, "
-                         "skipping it" % dnstr)
-                continue
             missing.append(dnstr)
 
         if not missing:
@@ -390,6 +375,21 @@ class KCC(object):
 
         DEBUG_FN("Adding partial replicas %s" % missing)
         if self.readonly:
+            return False
+
+        # hasPartialReplicaNCs needs the (uninstantiated) NC head of
+        # the partial replica. It is created with the crossRef of a
+        # new domain, when it is added or replicated to us; a domain
+        # that existed before this DC (e.g. the forest root, seen from
+        # a GC of a child domain) has none yet, we create it.
+        for dnstr in list(missing):
+            try:
+                self.ensure_partial_replica_nc_head(dnstr)
+            except (ldb.LdbError, KCCError) as e:
+                logger.warning("Can't create the NC head of the partial "
+                               "replica of %s: %s" % (dnstr, e))
+                missing.remove(dnstr)
+        if not missing:
             return False
 
         m = ldb.Message()
@@ -405,6 +405,35 @@ class KCC(object):
                            (missing, estr))
             return False
         return True
+
+    def ensure_partial_replica_nc_head(self, dnstr):
+        """Create the uninstantiated NC head of the partial replica of
+        a domain NC, with the GUID and SID from its crossRef, unless we
+        already have it.
+        """
+        try:
+            self.samdb.search(base=dnstr, scope=ldb.SCOPE_BASE,
+                              attrs=["instanceType"])
+            return
+        except ldb.LdbError as e:
+            (enum, estr) = e.args
+            if enum != ldb.ERR_NO_SUCH_OBJECT:
+                raise
+
+        part = None
+        for p in self.part_table.values():
+            if p.nc_dnstr == dnstr:
+                part = p
+                break
+        if part is None or part.nc_guid is None:
+            raise KCCError("No GUID known for %s" % dnstr)
+        ext_dn = "<GUID=%s>" % part.nc_guid
+        if part.nc_sid is not None:
+            sid = ndr_unpack(security.dom_sid, part.nc_sid)
+            ext_dn += ";<SID=%s>" % sid
+        ext_dn += ";%s" % dnstr
+        DEBUG_FN("Creating the NC head of the partial replica %s" % ext_dn)
+        dsdb._dsdb_create_partial_replica_NC(self.samdb, ext_dn)
 
     def refresh_failed_links_connections(self, ping=None):
         """Ensure the failed links list is up to date
@@ -2137,8 +2166,10 @@ class KCC(object):
             # that matches NC (x) we are examining.
             f_of_x = dc_s.current_rep_table[nc_x.nc_dnstr]
 
-            # Replica (f) of NC (x) must be writable
-            if f_of_x.is_ro():
+            # Replica (f) of NC (x) must be writable (and full: in a
+            # multi-domain forest, a global catalog of another domain
+            # holds a partial replica of NC (x))
+            if f_of_x.is_ro() or f_of_x.is_partial():
                 continue
 
             # Replica (f) of NC (x) must satisfy the
