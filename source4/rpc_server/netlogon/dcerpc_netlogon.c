@@ -3021,6 +3021,103 @@ static NTSTATUS fill_our_one_domain_info(TALLOC_CTX *mem_ctx,
 	return NT_STATUS_OK;
 }
 
+struct netr_forest_domain {
+	const char *netbios_name;
+	const char *dns_name;
+	struct dom_sid sid;
+	struct GUID guid;
+	struct ldb_dn *xref_dn;
+	struct ldb_dn *parent_xref_dn;
+};
+
+static WERROR netr_load_forest_domains(TALLOC_CTX *mem_ctx,
+				       struct ldb_context *sam_ctx,
+				       struct netr_forest_domain **_domains,
+				       size_t *_num_domains);
+
+/*
+  fix the forest flags (tree root), the parent_index of the trusted
+  domains list and the forest name of the primary domain of a
+  netr_DomainInformation, in a multi-domain forest
+*/
+static NTSTATUS netr_fix_forest_domain_info(TALLOC_CTX *mem_ctx,
+					    struct ldb_context *sam_ctx,
+					    struct netr_DomainInformation *di)
+{
+	struct netr_forest_domain *domains = NULL;
+	size_t num_domains = 0;
+	const char *forest_name = NULL;
+	ssize_t *map = NULL;
+	uint32_t k, l;
+	WERROR werr;
+
+	forest_name = samdb_forest_name(sam_ctx, mem_ctx);
+	if (forest_name != NULL) {
+		di->primary_domain.dns_forestname.string =
+			talloc_asprintf(mem_ctx, "%s.", forest_name);
+		if (di->primary_domain.dns_forestname.string == NULL) {
+			return NT_STATUS_NO_MEMORY;
+		}
+	}
+
+	werr = netr_load_forest_domains(mem_ctx, sam_ctx,
+					&domains, &num_domains);
+	if (!W_ERROR_IS_OK(werr)) {
+		return werror_to_ntstatus(werr);
+	}
+
+	/* the forest domain of each entry of the trust list */
+	map = talloc_array(mem_ctx, ssize_t, di->trusted_domain_count);
+	if (map == NULL && di->trusted_domain_count > 0) {
+		return NT_STATUS_NO_MEMORY;
+	}
+	for (k = 0; k < di->trusted_domain_count; k++) {
+		const struct dom_sid *sid = di->trusted_domains[k].domain_sid;
+		size_t d;
+
+		map[k] = -1;
+		for (d = 0; sid != NULL && d < num_domains; d++) {
+			if (dom_sid_equal(&domains[d].sid, sid)) {
+				map[k] = d;
+				break;
+			}
+		}
+	}
+
+	for (k = 0; k < di->trusted_domain_count; k++) {
+		struct netr_trust_extension *te =
+			di->trusted_domains[k].trust_extension.info;
+		struct netr_forest_domain *d = NULL;
+
+		if (te == NULL || map[k] == -1) {
+			continue;
+		}
+		d = &domains[map[k]];
+
+		te->info.flags |= NETR_TRUST_FLAG_IN_FOREST |
+				  NETR_TRUST_FLAG_NATIVE;
+		if (d->parent_xref_dn == NULL) {
+			te->info.flags |= NETR_TRUST_FLAG_TREEROOT;
+			te->info.parent_index = 0;
+			continue;
+		}
+		te->info.flags &= ~NETR_TRUST_FLAG_TREEROOT;
+		te->info.parent_index = 0;
+		for (l = 0; l < di->trusted_domain_count; l++) {
+			if (map[l] == -1) {
+				continue;
+			}
+			if (ldb_dn_compare(domains[map[l]].xref_dn,
+					   d->parent_xref_dn) == 0) {
+				te->info.parent_index = l;
+				break;
+			}
+		}
+	}
+
+	return NT_STATUS_OK;
+}
+
 /*
   fill in a netr_OneDomainInfo from a trust tdo
 */
@@ -3403,6 +3500,17 @@ static NTSTATUS dcesrv_netr_LogonGetDomainInfo(struct dcesrv_call_state *dce_cal
 						  *our_domain_guid,
 						  &domain_info->trusted_domains[i],
 						  true);
+		if (!NT_STATUS_IS_OK(status)) {
+			return status;
+		}
+
+		/*
+		 * In a multi-domain forest: tree roots and parent
+		 * domains of the domains of our forest, and the DNS
+		 * name of the forest.
+		 */
+		status = netr_fix_forest_domain_info(mem_ctx, sam_ctx,
+						     domain_info);
 		if (!NT_STATUS_IS_OK(status)) {
 			return status;
 		}
@@ -4511,11 +4619,8 @@ static WERROR fill_trusted_domains_array(TALLOC_CTX *mem_ctx,
 		}
 
 		trusts->array[n].trust_flags = flags;
-		if ((trust_flags & NETR_TRUST_FLAG_IN_FOREST) &&
-		    !(flags & NETR_TRUST_FLAG_TREEROOT)) {
-			/* TODO: find if we have parent in the list */
-			trusts->array[n].parent_index = 0;
-		}
+		/* see fill_forest_trusts_array() for the forest flags */
+		trusts->array[n].parent_index = 0;
 
 		trusts->array[n].trust_type =
 				ldb_msg_find_attr_as_uint(dom_res[i],
@@ -4555,6 +4660,227 @@ static WERROR fill_trusted_domains_array(TALLOC_CTX *mem_ctx,
 }
 
 /*
+  the domains of our forest, from the crossRefs of the Partitions
+  container: whether each one is a tree root, and the crossRef of its
+  parent domain
+ */
+static WERROR netr_load_forest_domains(TALLOC_CTX *mem_ctx,
+				       struct ldb_context *sam_ctx,
+				       struct netr_forest_domain **_domains,
+				       size_t *_num_domains)
+{
+	static const char * const attrs[] = { "nCName", "nETBIOSName",
+					      "dnsRoot", "trustParent",
+					      NULL };
+	struct netr_forest_domain *domains = NULL;
+	struct ldb_result *res = NULL;
+	struct ldb_dn *partitions_dn = NULL;
+	size_t num_domains = 0;
+	unsigned int i;
+	int ret;
+
+	*_domains = NULL;
+	*_num_domains = 0;
+
+	partitions_dn = samdb_partitions_dn(sam_ctx, mem_ctx);
+	if (partitions_dn == NULL) {
+		return WERR_NOT_ENOUGH_MEMORY;
+	}
+
+	ret = dsdb_search(sam_ctx, mem_ctx, &res, partitions_dn,
+			  LDB_SCOPE_ONELEVEL, attrs,
+			  DSDB_SEARCH_SHOW_EXTENDED_DN,
+			  "(&(objectClass=crossRef)"
+			  "(systemFlags:" LDB_OID_COMPARATOR_AND ":=%u))",
+			  SYSTEM_FLAG_CR_NTDS_NC | SYSTEM_FLAG_CR_NTDS_DOMAIN);
+	if (ret != LDB_SUCCESS) {
+		return WERR_GEN_FAILURE;
+	}
+
+	domains = talloc_zero_array(mem_ctx, struct netr_forest_domain,
+				    res->count);
+	if (domains == NULL && res->count > 0) {
+		return WERR_NOT_ENOUGH_MEMORY;
+	}
+
+	for (i = 0; i < res->count; i++) {
+		struct netr_forest_domain *d = &domains[num_domains];
+		struct ldb_dn *nc_dn = NULL;
+		NTSTATUS status;
+
+		nc_dn = ldb_msg_find_attr_as_dn(sam_ctx, domains,
+						res->msgs[i], "nCName");
+		if (nc_dn == NULL) {
+			continue;
+		}
+		status = dsdb_get_extended_dn_sid(nc_dn, &d->sid, "SID");
+		if (!NT_STATUS_IS_OK(status)) {
+			continue;
+		}
+		status = dsdb_get_extended_dn_guid(nc_dn, &d->guid, "GUID");
+		if (!NT_STATUS_IS_OK(status)) {
+			d->guid = GUID_zero();
+		}
+		d->netbios_name = ldb_msg_find_attr_as_string(res->msgs[i],
+							      "nETBIOSName",
+							      NULL);
+		d->dns_name = ldb_msg_find_attr_as_string(res->msgs[i],
+							  "dnsRoot", NULL);
+		if (d->netbios_name == NULL || d->dns_name == NULL) {
+			continue;
+		}
+		talloc_steal(domains, res->msgs[i]);
+		d->xref_dn = res->msgs[i]->dn;
+		d->parent_xref_dn = ldb_msg_find_attr_as_dn(sam_ctx, domains,
+							    res->msgs[i],
+							    "trustParent");
+		num_domains++;
+	}
+
+	*_domains = domains;
+	*_num_domains = num_domains;
+	return WERR_OK;
+}
+
+/*
+  The domains of our forest and our direct trusts, with the flags of
+  [MS-NRPC] 2.2.1.6.2 DS_DOMAIN_TRUSTSW, keeping only those matching
+  one of the requested trust_flags. parent_index is the index of the
+  parent domain (for a domain of the forest that is not a tree root).
+ */
+static WERROR fill_forest_trusts_array(TALLOC_CTX *mem_ctx,
+				       struct ldb_context *sam_ctx,
+				       struct netr_DomainTrustList *trusts,
+				       uint32_t trust_flags)
+{
+	struct netr_DomainTrustList *all = NULL;
+	struct netr_forest_domain *domains = NULL;
+	const struct dom_sid *our_sid = samdb_domain_sid(sam_ctx);
+	struct ldb_dn **xref = NULL;
+	struct ldb_dn **parent_xref = NULL;
+	uint32_t *new_index = NULL;
+	size_t num_domains = 0;
+	size_t i, j;
+	WERROR werr;
+
+	all = talloc_zero(mem_ctx, struct netr_DomainTrustList);
+	if (all == NULL || our_sid == NULL) {
+		return WERR_NOT_ENOUGH_MEMORY;
+	}
+
+	/* our direct trusts */
+	werr = fill_trusted_domains_array(all, sam_ctx, all,
+					  NETR_TRUST_FLAG_INBOUND |
+					  NETR_TRUST_FLAG_OUTBOUND);
+	W_ERROR_NOT_OK_RETURN(werr);
+
+	werr = netr_load_forest_domains(mem_ctx, sam_ctx,
+					&domains, &num_domains);
+	W_ERROR_NOT_OK_RETURN(werr);
+
+	xref = talloc_zero_array(mem_ctx, struct ldb_dn *,
+				 all->count + num_domains);
+	parent_xref = talloc_zero_array(mem_ctx, struct ldb_dn *,
+					all->count + num_domains);
+	if (xref == NULL || parent_xref == NULL) {
+		return WERR_NOT_ENOUGH_MEMORY;
+	}
+
+	/* the domains of our forest, merged with the direct trusts */
+	for (i = 0; i < num_domains; i++) {
+		struct netr_forest_domain *d = &domains[i];
+		struct netr_DomainTrust *t = NULL;
+		uint32_t flags = NETR_TRUST_FLAG_IN_FOREST |
+				 NETR_TRUST_FLAG_NATIVE;
+
+		if (d->parent_xref_dn == NULL) {
+			flags |= NETR_TRUST_FLAG_TREEROOT;
+		}
+		if (dom_sid_equal(&d->sid, our_sid)) {
+			flags |= NETR_TRUST_FLAG_PRIMARY;
+		}
+
+		for (j = 0; j < all->count; j++) {
+			if (all->array[j].sid == NULL ||
+			    !(all->array[j].trust_attributes &
+			      LSA_TRUST_ATTRIBUTE_WITHIN_FOREST)) {
+				continue;
+			}
+			if (dom_sid_equal(all->array[j].sid, &d->sid)) {
+				break;
+			}
+		}
+
+		if (j == all->count) {
+			all->array = talloc_realloc(all, all->array,
+						    struct netr_DomainTrust,
+						    all->count + 1);
+			W_ERROR_HAVE_NO_MEMORY(all->array);
+			t = &all->array[all->count];
+			ZERO_STRUCTP(t);
+			all->count++;
+			t->netbios_name = d->netbios_name;
+			t->dns_name = d->dns_name;
+			t->trust_type = LSA_TRUST_TYPE_UPLEVEL;
+			t->trust_attributes = 0;
+			t->sid = dom_sid_dup(all, &d->sid);
+			W_ERROR_HAVE_NO_MEMORY(t->sid);
+		} else {
+			t = &all->array[j];
+		}
+
+		t->trust_flags |= flags;
+		t->guid = d->guid;
+		xref[j] = d->xref_dn;
+		parent_xref[j] = d->parent_xref_dn;
+	}
+
+	/* keep the domains matching one of the requested flags */
+	new_index = talloc_array(mem_ctx, uint32_t, all->count);
+	if (new_index == NULL && all->count > 0) {
+		return WERR_NOT_ENOUGH_MEMORY;
+	}
+	for (i = 0; i < all->count; i++) {
+		uint32_t n;
+
+		new_index[i] = UINT32_MAX;
+		if (!(all->array[i].trust_flags & trust_flags)) {
+			continue;
+		}
+		n = trusts->count;
+		trusts->array = talloc_realloc(trusts, trusts->array,
+					       struct netr_DomainTrust,
+					       n + 1);
+		W_ERROR_HAVE_NO_MEMORY(trusts->array);
+		trusts->array[n] = all->array[i];
+		talloc_steal(trusts->array, all->array[i].sid);
+		trusts->array[n].parent_index = 0;
+		trusts->count = n + 1;
+		new_index[i] = n;
+	}
+
+	/* parent_index of the domains of our forest */
+	for (i = 0; i < all->count; i++) {
+		uint32_t n = new_index[i];
+
+		if (n == UINT32_MAX || parent_xref[i] == NULL) {
+			continue;
+		}
+		for (j = 0; j < all->count; j++) {
+			if (new_index[j] == UINT32_MAX || xref[j] == NULL) {
+				continue;
+			}
+			if (ldb_dn_compare(xref[j], parent_xref[i]) == 0) {
+				trusts->array[n].parent_index = new_index[j];
+				break;
+			}
+		}
+	}
+
+	return WERR_OK;
+}
+
+/*
   netr_DsrEnumerateDomainTrusts
 */
 static WERROR dcesrv_netr_DsrEnumerateDomainTrusts(struct dcesrv_call_state *dce_call,
@@ -4563,9 +4889,6 @@ static WERROR dcesrv_netr_DsrEnumerateDomainTrusts(struct dcesrv_call_state *dce
 {
 	struct netr_DomainTrustList *trusts;
 	struct ldb_context *sam_ctx;
-	int ret;
-	struct ldb_message **dom_res;
-	const char * const dom_attrs[] = { "objectSid", "objectGUID", NULL };
 	struct loadparm_context *lp_ctx = dce_call->conn->dce_ctx->lp_ctx;
 	const char *dnsdomain = lpcfg_dnsdomain(lp_ctx);
 	const char *p;
@@ -4607,48 +4930,14 @@ static WERROR dcesrv_netr_DsrEnumerateDomainTrusts(struct dcesrv_call_state *dce
 		return WERR_GEN_FAILURE;
 	}
 
-	if ((r->in.trust_flags & NETR_TRUST_FLAG_INBOUND) ||
-	    (r->in.trust_flags & NETR_TRUST_FLAG_OUTBOUND)) {
-
-		werr = fill_trusted_domains_array(mem_ctx, sam_ctx,
-						  trusts, r->in.trust_flags);
-		W_ERROR_NOT_OK_RETURN(werr);
-	}
-
-	/* NOTE: we currently are always the root of the forest */
-	if (r->in.trust_flags & NETR_TRUST_FLAG_IN_FOREST) {
-		uint32_t n = trusts->count;
-
-		ret = gendb_search_dn(sam_ctx, mem_ctx, NULL,
-				      &dom_res, dom_attrs);
-		if (ret != 1) {
-			return WERR_GEN_FAILURE;
-		}
-
-		trusts->count = n + 1;
-		trusts->array = talloc_realloc(trusts, trusts->array,
-					       struct netr_DomainTrust,
-					       trusts->count);
-		W_ERROR_HAVE_NO_MEMORY(trusts->array);
-
-		trusts->array[n].netbios_name = lpcfg_workgroup(lp_ctx);
-		trusts->array[n].dns_name = lpcfg_dnsdomain(lp_ctx);
-		trusts->array[n].trust_flags =
-			NETR_TRUST_FLAG_NATIVE |
-			NETR_TRUST_FLAG_TREEROOT |
-			NETR_TRUST_FLAG_IN_FOREST |
-			NETR_TRUST_FLAG_PRIMARY;
-		/* we are always the root domain for now */
-		trusts->array[n].parent_index = 0;
-		trusts->array[n].trust_type = LSA_TRUST_TYPE_UPLEVEL;
-		trusts->array[n].trust_attributes = 0;
-		trusts->array[n].sid = samdb_result_dom_sid(mem_ctx,
-							    dom_res[0],
-							    "objectSid");
-		trusts->array[n].guid = samdb_result_guid(dom_res[0],
-							  "objectGUID");
-		talloc_free(dom_res);
-	}
+	/*
+	 * Our direct trusts and the domains of our forest (we may be
+	 * a child domain), each with all its flags, keeping those that
+	 * match one of the requested flags.
+	 */
+	werr = fill_forest_trusts_array(mem_ctx, sam_ctx,
+					trusts, r->in.trust_flags);
+	W_ERROR_NOT_OK_RETURN(werr);
 
 	return WERR_OK;
 }
