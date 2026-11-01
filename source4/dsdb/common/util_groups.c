@@ -162,6 +162,25 @@ NTSTATUS dsdb_expand_nested_groups(struct ldb_context *sam_ctx,
 			sid_attrs |= SE_GROUP_RESOURCE;
 		}
 
+		/*
+		 * A group of another domain of our forest (found in
+		 * the partial replica of its domain, on a global
+		 * catalog) only counts here if it is a universal
+		 * group: its global and domain local groups only apply
+		 * in that domain, its DCs add them themselves.
+		 */
+		if (!(group_type & GROUP_TYPE_UNIVERSAL_GROUP)) {
+			const struct dom_sid *domain_sid =
+				samdb_domain_sid(sam_ctx);
+
+			if (domain_sid != NULL &&
+			    !dom_sid_in_domain(domain_sid, &sid) &&
+			    !dom_sid_in_domain(&global_sid_Builtin, &sid)) {
+				talloc_free(tmp_ctx);
+				return NT_STATUS_OK;
+			}
+		}
+
 		/* This is an O(n^2) linear search */
 		already_there = sids_contains_sid_attrs(*res_sids, *num_res_sids,
 							&sid, sid_attrs);
