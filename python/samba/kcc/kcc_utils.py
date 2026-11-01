@@ -87,7 +87,9 @@ class NamingContext(object):
 
         except ldb.LdbError as e:
             (enum, estr) = e.args
-            if enum == ldb.ERR_NO_SUCH_OBJECT and self.load_nc_from_crossref(samdb):
+            if (enum == ldb.ERR_NO_SUCH_OBJECT and
+                    getattr(samdb, "harden_multi_domain", False) and
+                    self.load_nc_from_crossref(samdb)):
                 return
             raise KCCError("Unable to find naming context (%s) - (%s)" %
                            (self.nc_dnstr, estr))
@@ -1371,6 +1373,8 @@ class Partition(NamingContext):
         self.system_flags = 0
         self.rw_location_list = []
         self.ro_location_list = []
+        # "harden:multi-domain forest", see load_partition()
+        self.multi_domain = False
 
         # We don't have enough info to properly
         # fill in the naming context yet.  We'll get that
@@ -1391,9 +1395,14 @@ class Partition(NamingContext):
                  "systemFlags",
                  "msDS-NC-Replica-Locations",
                  "msDS-NC-RO-Replica-Locations"]
+        self.multi_domain = getattr(samdb, "harden_multi_domain", False)
+        if self.multi_domain:
+            controls = ["extended_dn:1:1"]
+        else:
+            controls = None
         try:
             res = samdb.search(base=self.partstr, scope=ldb.SCOPE_BASE,
-                               attrs=attrs, controls=["extended_dn:1:1"])
+                               attrs=attrs, controls=controls)
 
         except ldb.LdbError as e15:
             (enum, estr) = e15.args
@@ -1424,12 +1433,13 @@ class Partition(NamingContext):
                     # The GUID and SID of the NC are also known
                     # for the NCs we don't hold (e.g. the domain
                     # NC of another domain of the forest)
-                    guid = dsdn.dn.get_extended_component("GUID")
-                    if guid is not None:
-                        self.nc_guid = ndr_unpack(misc.GUID, guid)
-                    sid = dsdn.dn.get_extended_component("SID")
-                    if sid is not None:
-                        self.nc_sid = sid
+                    if getattr(samdb, "harden_multi_domain", False):
+                        guid = dsdn.dn.get_extended_component("GUID")
+                        if guid is not None:
+                            self.nc_guid = ndr_unpack(misc.GUID, guid)
+                        sid = dsdn.dn.get_extended_component("SID")
+                        if sid is not None:
+                            self.nc_sid = sid
                     continue
 
                 if k == "msDS-NC-Replica-Locations":
@@ -1500,7 +1510,8 @@ class Partition(NamingContext):
             self.nc_dnstr != target_dsa.default_dnstr and
             (target_dsa.dsa_dnstr in self.ro_location_list or
              target_dsa.dsa_dnstr in self.rw_location_list or
-             target_dsa.get_current_replica(self.nc_dnstr) is not None)):
+             (self.multi_domain and
+              target_dsa.get_current_replica(self.nc_dnstr) is not None))):
             needed = True
             partial = True
 

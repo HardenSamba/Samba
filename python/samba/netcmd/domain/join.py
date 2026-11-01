@@ -29,6 +29,7 @@ import samba
 import samba.getopt as options
 from samba import is_ad_dc_built
 from samba.dcerpc import nbt
+from samba.harden import MULTI_DOMAIN_FOREST, multi_domain_forest
 from samba.join import join_DC, join_RODC, join_subdomain
 from samba.net import LIBNET_JOIN_AUTOMATIC, Net
 from samba.net_s3 import Net as s3_Net
@@ -151,6 +152,13 @@ class cmd_domain_join(Command):
                       backend_store=backend_store,
                       backend_store_size=backend_store_size)
         elif role == "SUBDOMAIN" and is_ad_dc_built():
+            if not multi_domain_forest(lp):
+                raise CommandError("The SUBDOMAIN role needs the "
+                                   "multi-domain forest support: set "
+                                   "'%s = yes' in smb.conf (or with "
+                                   "--option), on this server and on "
+                                   "the DCs of the forest" %
+                                   MULTI_DOMAIN_FOREST)
             logger.warning("Creating a child domain is EXPERIMENTAL: "
                            "multi-domain forests are not fully supported "
                            "by Samba yet")

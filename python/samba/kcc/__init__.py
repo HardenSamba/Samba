@@ -39,6 +39,7 @@ from samba.kcc.graph import convert_schedule_to_repltimes
 from samba.ndr import ndr_pack, ndr_unpack
 
 from samba.kcc.graph_utils import verify_and_dot
+from samba.harden import multi_domain_forest
 
 from samba.kcc import ldif_import_export
 from samba.kcc.graph import setup_graph, get_spanning_tree_edges
@@ -124,6 +125,9 @@ class KCC(object):
         self.my_site = None
 
         self.samdb = None
+
+        # "harden:multi-domain forest", see load_samdb()
+        self.multi_domain = False
 
         self.unix_now = unix_now
         self.nt_now = unix2nttime(unix_now)
@@ -2404,7 +2408,7 @@ class KCC(object):
             # is partial (we are a GC and NC (x) is another domain),
             # R also has the partial replicas, which only get edges
             # from the others: connected, but not a double ring.
-            if partial:
+            if partial and self.multi_domain:
                 rw_verify_properties = ('connected',)
             else:
                 rw_verify_properties = ('connected',
@@ -2427,7 +2431,10 @@ class KCC(object):
         # Only the DCs of R count: in a multi-domain forest, a DC of
         # the site may hold no replica of NC (x) (it is in another
         # domain) while having connections for the other NCs.
-        r_dsas = set(x.dsa_dnstr for x in graph_list)
+        if self.multi_domain:
+            r_dsas = set(x.dsa_dnstr for x in graph_list)
+        else:
+            r_dsas = self.my_site.dsa_table
         for vertex in graph_list:
             dsa = self.my_site.dsa_table[vertex.dsa_dnstr]
             for connect in dsa.connect_table.values():
@@ -2511,7 +2518,7 @@ class KCC(object):
             # is partial (we are a GC and NC (x) is another domain),
             # R also has the partial replicas, which only get edges
             # from the others: connected, but not a double ring.
-            if partial:
+            if partial and self.multi_domain:
                 rw_verify_properties = ('connected',)
             else:
                 rw_verify_properties = ('connected',
@@ -2642,6 +2649,7 @@ class KCC(object):
         :param force: a boolean indicating whether to overwrite.
 
         """
+        self.multi_domain = multi_domain_forest(lp)
         if force or self.samdb is None:
             try:
                 self.samdb = SamDB(url=dburl,
@@ -2651,6 +2659,8 @@ class KCC(object):
                 (num, msg) = e1.args
                 raise KCCError("Unable to open sam database %s : %s" %
                                (dburl, msg))
+            # for kcc_utils (see NamingContext.load_nc_info())
+            self.samdb.harden_multi_domain = self.multi_domain
 
     def plot_all_connections(self, basename, verify_properties=()):
         """Helper function to plot and verify NTDSConnections
@@ -2680,7 +2690,7 @@ class KCC(object):
                     edge_colours.append('blue')
                 dot_edges.append((con.from_dnstr, dsa.dsa_dnstr))
 
-        if verify:
+        if verify and self.multi_domain:
             # A DSA with no connection at all, in either direction, is
             # one whose KCC results have not reached us yet (its own
             # inbound connections are created by its KCC): with more
@@ -2739,11 +2749,12 @@ class KCC(object):
 
             self.load_all_sites()
             self.load_all_partitions()
-            if self.refresh_gc_partial_replicas():
+            if self.multi_domain and self.refresh_gc_partial_replicas():
                 # our replica tables changed
                 self.load_my_dsa()
                 self.load_all_sites()
-            self.run_infrastructure_update(lp, creds)
+            if self.multi_domain:
+                self.run_infrastructure_update(lp, creds)
             self.load_ip_transport()
             self.load_all_sitelinks()
 

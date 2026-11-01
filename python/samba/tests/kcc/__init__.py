@@ -53,6 +53,12 @@ class KCCTests(samba.tests.TestCase):
     def setUp(self):
         super().setUp()
         self.lp = LoadParm()
+        if os.environ.get("TEST_ENV") in ("ad_dc_ntvfs", "vampire_dc",
+                                          "promoted_dc"):
+            # These DCs are in the forest of ad_dc_ntvfs, which gets a
+            # child domain (subdom_dc): they run with the multi-domain
+            # forest support, so must the KCC we run for them.
+            self.lp.set("harden:multi-domain forest", "yes")
         self.creds = Credentials()
         self.creds.guess(self.lp)
         self.creds.set_username(os.environ["USERNAME"])
