@@ -82,6 +82,12 @@ struct replmd_private {
 	uint32_t num_processed;
 	bool recyclebin_enabled;
 	bool recyclebin_state_known;
+	/*
+	 * GUIDs of the objects added by DRS replication in this
+	 * transaction, see replmd_resolve_pending_backlinks()
+	 */
+	struct GUID *new_guids;
+	size_t num_new_guids;
 };
 
 /*
@@ -358,6 +364,8 @@ static void replmd_txn_cleanup(struct replmd_private *replmd_private)
 	replmd_private->la_list = NULL;
 	replmd_private->la_ctx = NULL;
 	replmd_private->recyclebin_state_known = false;
+	TALLOC_FREE(replmd_private->new_guids);
+	replmd_private->num_new_guids = 0;
 }
 
 
@@ -470,6 +478,320 @@ static int replmd_backlink_invisible(struct ldb_module *module,
   process a backlinks we accumulated during a transaction, adding and
   deleting the backlinks from the target objects
  */
+/*
+ * Pending backlinks
+ *
+ * The target of a forward link may be in a naming context we don't
+ * hold (yet): the serverReference of a DC of another domain of the
+ * forest, a member of a group that belongs to another domain... Windows
+ * keeps a phantom for it. We remember the backlink in a special record
+ * instead, and add it when the target arrives, e.g. with the partial
+ * replica of its domain on a global catalog.
+ *
+ * Each value of @REPLMD_PENDING_BACKLINKS is
+ * "<target GUID>;<backlink attribute>;<extended DN of the source>".
+ */
+#define REPLMD_PENDING_BACKLINKS_DN "@REPLMD_PENDING_BACKLINKS"
+#define REPLMD_PENDING_BACKLINKS_ATTR "pendingBacklink"
+
+static int replmd_pending_backlink_parse(TALLOC_CTX *mem_ctx,
+					 const struct ldb_val *v,
+					 struct GUID *target_guid,
+					 char **attr_name,
+					 char **source_dn)
+{
+	char *str = NULL;
+	char *p1 = NULL;
+	char *p2 = NULL;
+	NTSTATUS status;
+
+	str = talloc_strndup(mem_ctx, (const char *)v->data, v->length);
+	if (str == NULL) {
+		return LDB_ERR_OPERATIONS_ERROR;
+	}
+	p1 = strchr(str, ';');
+	if (p1 == NULL) {
+		return LDB_ERR_INVALID_ATTRIBUTE_SYNTAX;
+	}
+	*p1++ = '\0';
+	p2 = strchr(p1, ';');
+	if (p2 == NULL) {
+		return LDB_ERR_INVALID_ATTRIBUTE_SYNTAX;
+	}
+	*p2++ = '\0';
+
+	status = GUID_from_string(str, target_guid);
+	if (!NT_STATUS_IS_OK(status)) {
+		return LDB_ERR_INVALID_ATTRIBUTE_SYNTAX;
+	}
+	*attr_name = p1;
+	*source_dn = p2;
+	return LDB_SUCCESS;
+}
+
+/*
+ * remember (active) or forget (!active) the backlink of a forward
+ * link whose target we don't have
+ */
+static int replmd_pending_backlink_update(struct ldb_module *module,
+					  struct la_backlink *bl,
+					  const char *source_dn_str,
+					  struct ldb_request *parent)
+{
+	struct ldb_context *ldb = ldb_module_get_ctx(module);
+	const char * const attrs[] = { REPLMD_PENDING_BACKLINKS_ATTR, NULL };
+	TALLOC_CTX *frame = talloc_stackframe();
+	struct ldb_message_element *el = NULL;
+	struct ldb_result *res = NULL;
+	struct ldb_message *msg = NULL;
+	struct ldb_dn *dn = NULL;
+	struct GUID_txt_buf guid_buf;
+	char *value = NULL;
+	bool exists = false;
+	int ret;
+
+	dn = ldb_dn_new(frame, ldb, REPLMD_PENDING_BACKLINKS_DN);
+	if (dn == NULL) {
+		TALLOC_FREE(frame);
+		return ldb_module_oom(module);
+	}
+
+	value = talloc_asprintf(frame, "%s;%s;%s",
+				GUID_buf_string(&bl->target_guid, &guid_buf),
+				bl->attr_name, source_dn_str);
+	if (value == NULL) {
+		TALLOC_FREE(frame);
+		return ldb_module_oom(module);
+	}
+
+	ret = dsdb_module_search_dn(module, frame, &res, dn, attrs,
+				    DSDB_FLAG_NEXT_MODULE, parent);
+	if (ret == LDB_SUCCESS) {
+		exists = true;
+	} else if (ret != LDB_ERR_NO_SUCH_OBJECT) {
+		TALLOC_FREE(frame);
+		return ret;
+	}
+
+	if (!bl->active && !exists) {
+		TALLOC_FREE(frame);
+		return LDB_SUCCESS;
+	}
+
+	msg = ldb_msg_new(frame);
+	if (msg == NULL) {
+		TALLOC_FREE(frame);
+		return ldb_module_oom(module);
+	}
+	msg->dn = dn;
+
+	if (bl->active && !exists) {
+		ret = ldb_msg_add_string(msg, REPLMD_PENDING_BACKLINKS_ATTR,
+					 value);
+		if (ret != LDB_SUCCESS) {
+			TALLOC_FREE(frame);
+			return ret;
+		}
+		ret = dsdb_module_add(module, msg, DSDB_FLAG_NEXT_MODULE,
+				      parent);
+		TALLOC_FREE(frame);
+		return ret;
+	}
+
+	el = ldb_msg_find_element(res->msgs[0], REPLMD_PENDING_BACKLINKS_ATTR);
+	if (el != NULL) {
+		DATA_BLOB value_blob = data_blob_string_const(value);
+		unsigned int i;
+
+		for (i = 0; i < el->num_values; i++) {
+			if (data_blob_cmp(&el->values[i], &value_blob) == 0) {
+				break;
+			}
+		}
+		if (bl->active && i < el->num_values) {
+			/* already pending */
+			TALLOC_FREE(frame);
+			return LDB_SUCCESS;
+		}
+		if (!bl->active && i == el->num_values) {
+			/* not pending */
+			TALLOC_FREE(frame);
+			return LDB_SUCCESS;
+		}
+	} else if (!bl->active) {
+		TALLOC_FREE(frame);
+		return LDB_SUCCESS;
+	}
+
+	ret = ldb_msg_add_string(msg, REPLMD_PENDING_BACKLINKS_ATTR, value);
+	if (ret != LDB_SUCCESS) {
+		TALLOC_FREE(frame);
+		return ret;
+	}
+	msg->elements[0].flags = bl->active ?
+		LDB_FLAG_MOD_ADD : LDB_FLAG_MOD_DELETE;
+
+	ret = dsdb_module_modify(module, msg, DSDB_FLAG_NEXT_MODULE, parent);
+	TALLOC_FREE(frame);
+	return ret;
+}
+
+static bool replmd_is_new_guid(struct replmd_private *replmd_private,
+			       const struct GUID *guid)
+{
+	size_t i;
+
+	for (i = 0; i < replmd_private->num_new_guids; i++) {
+		if (GUID_equal(&replmd_private->new_guids[i], guid)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+/*
+ * Add the pending backlinks whose target arrived (was added by DRS
+ * replication) in this transaction.
+ */
+static int replmd_resolve_pending_backlinks(struct ldb_module *module,
+					    struct replmd_private *replmd_private)
+{
+	struct ldb_context *ldb = ldb_module_get_ctx(module);
+	const char * const attrs[] = { REPLMD_PENDING_BACKLINKS_ATTR, NULL };
+	const char * const empty_attrs[] = { NULL };
+	TALLOC_CTX *frame = NULL;
+	struct ldb_message_element *el = NULL;
+	struct ldb_message *keep = NULL;
+	struct ldb_result *res = NULL;
+	struct ldb_dn *dn = NULL;
+	unsigned int i;
+	unsigned int resolved = 0;
+	int ret;
+
+	if (replmd_private->num_new_guids == 0) {
+		return LDB_SUCCESS;
+	}
+
+	frame = talloc_stackframe();
+	dn = ldb_dn_new(frame, ldb, REPLMD_PENDING_BACKLINKS_DN);
+	if (dn == NULL) {
+		TALLOC_FREE(frame);
+		return ldb_module_oom(module);
+	}
+
+	ret = dsdb_module_search_dn(module, frame, &res, dn, attrs,
+				    DSDB_FLAG_NEXT_MODULE, NULL);
+	if (ret == LDB_ERR_NO_SUCH_OBJECT) {
+		TALLOC_FREE(frame);
+		return LDB_SUCCESS;
+	}
+	if (ret != LDB_SUCCESS) {
+		TALLOC_FREE(frame);
+		return ret;
+	}
+
+	el = ldb_msg_find_element(res->msgs[0], REPLMD_PENDING_BACKLINKS_ATTR);
+	if (el == NULL) {
+		TALLOC_FREE(frame);
+		return LDB_SUCCESS;
+	}
+
+	keep = ldb_msg_new(frame);
+	if (keep == NULL) {
+		TALLOC_FREE(frame);
+		return ldb_module_oom(module);
+	}
+	keep->dn = dn;
+
+	for (i = 0; i < el->num_values; i++) {
+		struct ldb_message *msg = NULL;
+		struct ldb_message *target = NULL;
+		struct GUID target_guid;
+		char *attr_name = NULL;
+		char *source_dn = NULL;
+
+		ret = replmd_pending_backlink_parse(frame, &el->values[i],
+						    &target_guid, &attr_name,
+						    &source_dn);
+		if (ret != LDB_SUCCESS) {
+			/* drop a broken value */
+			continue;
+		}
+
+		if (!replmd_is_new_guid(replmd_private, &target_guid)) {
+			ret = ldb_msg_add_value(keep,
+						REPLMD_PENDING_BACKLINKS_ATTR,
+						&el->values[i], NULL);
+			if (ret != LDB_SUCCESS) {
+				TALLOC_FREE(frame);
+				return ret;
+			}
+			continue;
+		}
+
+		ret = dsdb_module_obj_by_guid(module, frame, &target,
+					      &target_guid, empty_attrs,
+					      NULL);
+		if (ret != LDB_SUCCESS) {
+			ret = ldb_msg_add_value(keep,
+						REPLMD_PENDING_BACKLINKS_ATTR,
+						&el->values[i], NULL);
+			if (ret != LDB_SUCCESS) {
+				TALLOC_FREE(frame);
+				return ret;
+			}
+			continue;
+		}
+
+		msg = ldb_msg_new(frame);
+		if (msg == NULL) {
+			TALLOC_FREE(frame);
+			return ldb_module_oom(module);
+		}
+		msg->dn = target->dn;
+		ret = ldb_msg_add_string(msg, attr_name, source_dn);
+		if (ret != LDB_SUCCESS) {
+			TALLOC_FREE(frame);
+			return ret;
+		}
+		msg->elements[0].flags = LDB_FLAG_MOD_ADD |
+			LDB_FLAG_INTERNAL_DISABLE_SINGLE_VALUE_CHECK;
+
+		ret = dsdb_module_modify(module, msg, DSDB_FLAG_NEXT_MODULE,
+					 NULL);
+		if (ret != LDB_SUCCESS &&
+		    ret != LDB_ERR_ATTRIBUTE_OR_VALUE_EXISTS) {
+			ldb_asprintf_errstring(ldb,
+				"Failed to add the pending backlink %s "
+				"from %s to %s - %s",
+				attr_name, source_dn,
+				ldb_dn_get_linearized(target->dn),
+				ldb_errstring(ldb));
+			TALLOC_FREE(frame);
+			return ret;
+		}
+		DBG_NOTICE("Added the pending backlink %s from %s to %s\n",
+			   attr_name, source_dn,
+			   ldb_dn_get_linearized(target->dn));
+		resolved++;
+	}
+
+	if (resolved == 0) {
+		TALLOC_FREE(frame);
+		return LDB_SUCCESS;
+	}
+
+	if (keep->num_elements == 0) {
+		ret = dsdb_module_del(module, dn, DSDB_FLAG_NEXT_MODULE, NULL);
+	} else {
+		keep->elements[0].flags = LDB_FLAG_MOD_REPLACE;
+		ret = dsdb_module_modify(module, keep, DSDB_FLAG_NEXT_MODULE,
+					 NULL);
+	}
+	TALLOC_FREE(frame);
+	return ret;
+}
+
 static int replmd_process_backlink(struct ldb_module *module, struct la_backlink *bl, struct ldb_request *parent)
 {
 	struct ldb_dn *target_dn, *source_dn;
@@ -504,9 +826,43 @@ static int replmd_process_backlink(struct ldb_module *module, struct la_backlink
 				      parent);
 	if (ret != LDB_SUCCESS) {
 		struct GUID_txt_buf guid_str;
-		DBG_WARNING("Failed to find target DN for linked attribute with GUID %s\n",
-			    GUID_buf_string(&bl->target_guid, &guid_str));
-		DBG_WARNING("Please run 'samba-tool dbcheck' to resolve any missing backlinks.\n");
+		const char *accept[] = { "GUID", "SID", NULL };
+		char *source_str = NULL;
+
+		source_dn = ldb_dn_copy(frame, bl->forward_dn);
+		if (source_dn == NULL) {
+			talloc_free(frame);
+			return ldb_module_oom(module);
+		}
+		ldb_dn_extended_filter(source_dn, accept);
+		source_str = ldb_dn_get_extended_linearized(frame,
+							    source_dn, 1);
+		if (source_str == NULL) {
+			talloc_free(frame);
+			return ldb_module_oom(module);
+		}
+
+		/*
+		 * The target is not here (yet): typically in a NC we
+		 * don't hold. Remember the backlink, it is added when
+		 * the target arrives.
+		 */
+		ret = replmd_pending_backlink_update(module, bl, source_str,
+						     parent);
+		if (ret != LDB_SUCCESS) {
+			DBG_WARNING("Failed to find target DN for linked "
+				    "attribute with GUID %s\n",
+				    GUID_buf_string(&bl->target_guid,
+						    &guid_str));
+			DBG_WARNING("Please run 'samba-tool dbcheck' to "
+				    "resolve any missing backlinks.\n");
+		} else {
+			DBG_INFO("Backlink %s to GUID %s %s as pending\n",
+				 bl->attr_name,
+				 GUID_buf_string(&bl->target_guid,
+						 &guid_str),
+				 bl->active ? "recorded" : "removed");
+		}
 		talloc_free(frame);
 		return LDB_SUCCESS;
 	}
@@ -5715,6 +6071,23 @@ static int replmd_replicated_apply_add(struct replmd_replicated_request *ar)
 		return replmd_replicated_request_error(ar, ret);
 	}
 
+	{
+		/* see replmd_resolve_pending_backlinks() */
+		struct GUID *guids = NULL;
+
+		guids = talloc_realloc(replmd_private,
+				       replmd_private->new_guids,
+				       struct GUID,
+				       replmd_private->num_new_guids + 1);
+		if (guids == NULL) {
+			return replmd_replicated_request_error(
+				ar, ldb_module_oom(ar->module));
+		}
+		guids[replmd_private->num_new_guids++] =
+			ar->objs->objects[ar->index_current].object_guid;
+		replmd_private->new_guids = guids;
+	}
+
 	ret = ldb_msg_add_string(msg, "whenChanged", ar->objs->objects[ar->index_current].when_changed);
 	if (ret != LDB_SUCCESS) {
 		return replmd_replicated_request_error(ar, ret);
@@ -8797,6 +9170,12 @@ static int replmd_prepare_commit(struct ldb_module *module)
 			replmd_txn_cleanup(replmd_private);
 			return ret;
 		}
+	}
+
+	ret = replmd_resolve_pending_backlinks(module, replmd_private);
+	if (ret != LDB_SUCCESS) {
+		replmd_txn_cleanup(replmd_private);
+		return ret;
 	}
 
 	replmd_txn_cleanup(replmd_private);
