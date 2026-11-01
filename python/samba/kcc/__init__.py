@@ -19,7 +19,9 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
+import os
 import random
+import time
 import uuid
 from functools import cmp_to_key
 import itertools
@@ -405,6 +407,55 @@ class KCC(object):
                            (missing, estr))
             return False
         return True
+
+    def run_infrastructure_update(self, lp, creds):
+        """On the infrastructure master of our domain, in a multi-domain
+        forest, update the references of our domain NC to the objects of
+        the other domains of the forest (see samba.infrastructure), at
+        most every "kcc:infrastructure update interval" seconds (one
+        hour by default).
+        """
+        if self.readonly or lp is None:
+            return
+        try:
+            from samba.infrastructure import InfrastructureUpdate
+            infra = InfrastructureUpdate(self.samdb, logger)
+            if not infra.is_infrastructure_master():
+                return
+            if not infra.other_domain_ncs():
+                return
+
+            interval = int(lp.get("kcc:infrastructure update interval")
+                           or 3600)
+            stamp = lp.private_path("infrastructure_update.stamp")
+            try:
+                last = os.stat(stamp).st_mtime
+            except OSError:
+                last = 0
+            if time.time() - last < interval:
+                return
+            with open(stamp, "w"):
+                pass
+
+            if not infra.is_gc():
+                # the partial replicas of the other domains are on
+                # the global catalogs
+                for name in infra.find_gc():
+                    try:
+                        infra.gc = SamDB(url="ldap://%s:3268" % name,
+                                         session_info=system_session(),
+                                         credentials=creds, lp=lp)
+                        break
+                    except ldb.LdbError as e:
+                        logger.warning("Global catalog %s: %s" % (name, e))
+                else:
+                    return
+
+            changes = infra.run(fix=True)
+            DEBUG_FN("infrastructure update: %d references updated" %
+                     len(changes))
+        except (ldb.LdbError, ValueError) as e:
+            logger.warning("Infrastructure update failed: %s" % (e,))
 
     def ensure_partial_replica_nc_head(self, dnstr):
         """Create the uninstantiated NC head of the partial replica of
@@ -2692,6 +2743,7 @@ class KCC(object):
                 # our replica tables changed
                 self.load_my_dsa()
                 self.load_all_sites()
+            self.run_infrastructure_update(lp, creds)
             self.load_ip_transport()
             self.load_all_sitelinks()
 
